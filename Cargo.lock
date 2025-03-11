@@ -6,7 +6,6 @@ version = 4
 name = "Kgui"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "dashmap",
  "easytier",

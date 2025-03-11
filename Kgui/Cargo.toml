@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 easytier = { path = "../easytier" }
+once_cell = "1.19.0"
+dashmap = "6.1.0"
+tokio = "1.39.2"
+chrono = "0.4.38"
+anyhow = "1.0.95"

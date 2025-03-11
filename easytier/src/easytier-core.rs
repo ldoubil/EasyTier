@@ -413,6 +413,18 @@ impl Cli {
     }
 }
 
+/// 将 Cli 配置转换为 TomlConfigLoader 实例。
+/// 
+/// # 参数
+/// - cli: 引用类型的 Cli 结构体，包含命令行参数。
+/// 
+/// # 返回值
+/// - Result<TomlConfigLoader, anyhow::Error>: 成功时返回 TomlConfigLoader 实例，失败时返回错误信息。
+/// 
+/// # 逻辑说明
+/// 1. 如果提供了配置文件路径，则加载配置文件并忽略所有命令行标志。
+/// 2. 根据命令行参数逐步设置 TomlConfigLoader 的各项配置。
+/// 3. 包括网络身份、IPv4 地址、监听器、路由等配置项的解析与设置。
 impl TryFrom<&Cli> for TomlConfigLoader {
     type Error = anyhow::Error;
 
@@ -428,21 +440,26 @@ impl TryFrom<&Cli> for TomlConfigLoader {
 
         let cfg = TomlConfigLoader::default();
 
+        // 设置主机名
         cfg.set_hostname(cli.hostname.clone());
 
+        // 设置网络身份（包括网络名称和密钥）
         cfg.set_network_identity(NetworkIdentity::new(
             cli.network_name.clone(),
             cli.network_secret.clone(),
         ));
 
+        // 设置 DHCP 配置
         cfg.set_dhcp(cli.dhcp);
 
+        // 解析并设置 IPv4 地址
         if let Some(ipv4) = &cli.ipv4 {
             cfg.set_ipv4(Some(ipv4.parse().with_context(|| {
                 format!("failed to parse ipv4 address: {}", ipv4)
             })?))
         }
 
+        // 解析并设置对等节点配置
         let mut peers = Vec::<PeerConfig>::with_capacity(cli.peers.len());
         for p in &cli.peers {
             peers.push(PeerConfig {
@@ -453,6 +470,7 @@ impl TryFrom<&Cli> for TomlConfigLoader {
         }
         cfg.set_peers(peers);
 
+        // 解析并设置监听器配置
         cfg.set_listeners(
             Cli::parse_listeners(cli.no_listener, cli.listeners.clone())?
                 .into_iter()
@@ -460,6 +478,7 @@ impl TryFrom<&Cli> for TomlConfigLoader {
                 .collect(),
         );
 
+        // 解析并设置映射监听器配置
         cfg.set_mapped_listeners(Some(
             cli.mapped_listeners
                 .iter()
@@ -477,6 +496,7 @@ impl TryFrom<&Cli> for TomlConfigLoader {
                 .collect(),
         ));
 
+        // 添加代理网络 CIDR
         for n in cli.proxy_networks.iter() {
             cfg.add_proxy_cidr(
                 n.parse()
@@ -484,11 +504,13 @@ impl TryFrom<&Cli> for TomlConfigLoader {
             );
         }
 
+        // 设置 RPC 门户配置
         cfg.set_rpc_portal(
             Cli::parse_rpc_portal(cli.rpc_portal.clone())
                 .with_context(|| format!("failed to parse rpc portal: {}", cli.rpc_portal))?,
         );
 
+        // 如果存在外部节点，将其添加到对等节点列表中
         if let Some(external_nodes) = cli.external_node.as_ref() {
             let mut old_peers = cfg.get_peers();
             old_peers.push(PeerConfig {
@@ -499,12 +521,14 @@ impl TryFrom<&Cli> for TomlConfigLoader {
             cfg.set_peers(old_peers);
         }
 
+        // 设置控制台日志配置
         if cli.console_log_level.is_some() {
             cfg.set_console_logger_config(ConsoleLoggerConfig {
                 level: cli.console_log_level.clone(),
             });
         }
 
+        // 设置文件日志配置
         if cli.file_log_dir.is_some() || cli.file_log_level.is_some() {
             cfg.set_file_logger_config(FileLoggerConfig {
                 level: cli.file_log_level.clone(),
@@ -513,8 +537,10 @@ impl TryFrom<&Cli> for TomlConfigLoader {
             });
         }
 
+        // 设置实例名称
         cfg.set_inst_name(cli.instance_name.clone());
 
+        // 设置 VPN 门户配置
         if let Some(vpn_portal) = cli.vpn_portal.as_ref() {
             let url: url::Url = vpn_portal
                 .parse()
@@ -535,6 +561,7 @@ impl TryFrom<&Cli> for TomlConfigLoader {
             });
         }
 
+        // 设置手动路由配置
         if let Some(manual_routes) = cli.manual_routes.as_ref() {
             let mut routes = Vec::<cidr::Ipv4Cidr>::with_capacity(manual_routes.len());
             for r in manual_routes {
@@ -546,6 +573,7 @@ impl TryFrom<&Cli> for TomlConfigLoader {
             cfg.set_routes(Some(routes));
         }
 
+        // 设置 SOCKS5 代理配置（仅在启用 socks5 特性时）
         #[cfg(feature = "socks5")]
         if let Some(socks5_proxy) = cli.socks5 {
             cfg.set_socks5_portal(Some(
@@ -555,6 +583,7 @@ impl TryFrom<&Cli> for TomlConfigLoader {
             ));
         }
 
+        // 设置标志位配置
         let mut f = cfg.get_flags();
         if cli.default_protocol.is_some() {
             f.default_protocol = cli.default_protocol.as_ref().unwrap().clone();
@@ -598,6 +627,7 @@ impl TryFrom<&Cli> for TomlConfigLoader {
         f.disable_kcp_input = cli.disable_kcp_input;
         cfg.set_flags(f);
 
+        // 设置出口节点配置
         cfg.set_exit_nodes(cli.exit_nodes.clone());
 
         Ok(cfg)

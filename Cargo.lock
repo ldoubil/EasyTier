@@ -5,6 +5,14 @@ version = 4
 [[package]]
 name = "Kgui"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dashmap",
+ "easytier",
+ "once_cell",
+ "tokio",
+]
 
 [[package]]
 name = "ab_glyph_rasterizer"

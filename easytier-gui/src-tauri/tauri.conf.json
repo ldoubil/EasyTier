@@ -21,6 +21,9 @@
   "identifier": "com.kkrainbow.easytier",
   "plugins": {},
   "app": {
+    "build": {
+      "resources": ["./src-tauri/resources/"]
+    },
     "windows": [
       {
         "title": "easytier-gui",

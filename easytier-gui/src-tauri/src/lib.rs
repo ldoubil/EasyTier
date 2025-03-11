@@ -17,17 +17,21 @@ pub const AUTOSTART_ARG: &str = "--autostart";
 #[cfg(not(target_os = "android"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
+// 使用once_cell::sync::Lazy来初始化INSTANCE_MAP
 static INSTANCE_MAP: once_cell::sync::Lazy<DashMap<String, NetworkInstance>> =
     once_cell::sync::Lazy::new(DashMap::new);
 
+// 使用once_cell::sync::Lazy来初始化LOGGER_LEVEL_SENDER
 static mut LOGGER_LEVEL_SENDER: once_cell::sync::Lazy<Option<NewFilterSender>> =
     once_cell::sync::Lazy::new(Default::default);
 
+// 返回EasyTier的版本号
 #[tauri::command]
 fn easytier_version() -> Result<String, String> {
     Ok(easytier::VERSION.to_string())
 }
 
+// 检查是否以--autostart参数启动
 #[tauri::command]
 fn is_autostart() -> Result<bool, String> {
     let args: Vec<String> = std::env::args().collect();
@@ -35,13 +39,14 @@ fn is_autostart() -> Result<bool, String> {
     Ok(args.contains(&AUTOSTART_ARG.to_owned()))
 }
 
-// Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
+// 解析网络配置并返回Toml字符串
 #[tauri::command]
 fn parse_network_config(cfg: NetworkConfig) -> Result<String, String> {
     let toml = cfg.gen_config().map_err(|e| e.to_string())?;
     Ok(toml.dump())
 }
 
+// 运行网络实例
 #[tauri::command]
 fn run_network_instance(cfg: NetworkConfig) -> Result<(), String> {
     if INSTANCE_MAP.contains_key(cfg.instance_id()) {
@@ -58,6 +63,7 @@ fn run_network_instance(cfg: NetworkConfig) -> Result<(), String> {
     Ok(())
 }
 
+// 保留指定的网络实例
 #[tauri::command]
 fn retain_network_instance(instance_ids: Vec<String>) -> Result<(), String> {
     let _ = INSTANCE_MAP.retain(|k, _| instance_ids.contains(k));
@@ -71,6 +77,7 @@ fn retain_network_instance(instance_ids: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+// 收集网络实例的运行信息
 #[tauri::command]
 fn collect_network_infos() -> Result<BTreeMap<String, NetworkInstanceRunningInfo>, String> {
     let mut ret = BTreeMap::new();
@@ -82,11 +89,13 @@ fn collect_network_infos() -> Result<BTreeMap<String, NetworkInstanceRunningInfo
     Ok(ret)
 }
 
+// 获取操作系统主机名
 #[tauri::command]
 fn get_os_hostname() -> Result<String, String> {
     Ok(gethostname::gethostname().to_string_lossy().to_string())
 }
 
+// 设置日志级别
 #[tauri::command]
 fn set_logging_level(level: String) -> Result<(), String> {
     #[allow(static_mut_refs)]
@@ -95,6 +104,7 @@ fn set_logging_level(level: String) -> Result<(), String> {
     Ok(())
 }
 
+// 设置tun文件描述符
 #[tauri::command]
 fn set_tun_fd(instance_id: String, fd: i32) -> Result<(), String> {
     let mut instance = INSTANCE_MAP
@@ -104,6 +114,7 @@ fn set_tun_fd(instance_id: String, fd: i32) -> Result<(), String> {
     Ok(())
 }
 
+// 切换窗口可见性
 #[cfg(not(target_os = "android"))]
 fn toggle_window_visibility<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
@@ -116,6 +127,7 @@ fn toggle_window_visibility<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
+// 检查是否具有管理员权限
 #[cfg(not(target_os = "android"))]
 fn check_sudo() -> bool {
     use std::env::current_exe;
@@ -134,6 +146,7 @@ fn check_sudo() -> bool {
     is_elevated
 }
 
+// 应用启动入口
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(not(target_os = "android"))]
@@ -146,6 +159,7 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default();
 
+    // 添加Macos启动器插件
     #[cfg(not(target_os = "android"))]
     {
         use tauri_plugin_autostart::MacosLauncher;
@@ -155,6 +169,7 @@ pub fn run() {
         ));
     }
 
+    // 添加单实例插件
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -167,6 +182,7 @@ pub fn run() {
         }));
     }
 
+    // 添加其他插件
     builder = builder
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -174,9 +190,10 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_vpnservice::init());
 
+    // 设置应用
     let app = builder
         .setup(|app| {
-            // for logging config
+            // 配置日志
             let Ok(log_dir) = app.path().app_log_dir() else {
                 return Ok(());
             };
@@ -194,7 +211,7 @@ pub fn run() {
                 LOGGER_LEVEL_SENDER.replace(logger_reinit)
             };
 
-            // for tray icon, menu need to be built in js
+            // 配置托盘图标
             #[cfg(not(target_os = "android"))]
             let _tray_menu = TrayIconBuilder::with_id("main")
                 .menu_on_left_click(false)
@@ -239,6 +256,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .unwrap();
 
+    // 运行应用
     #[cfg(not(target_os = "macos"))]
     app.run(|_app, _event| {});
 

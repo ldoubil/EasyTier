@@ -12,7 +12,9 @@ use easytier::{
         constants::EASYTIER_VERSION,
         error::Error,
     },
-    tunnel::{tcp::TcpTunnelListener, udp::UdpTunnelListener, TunnelListener},
+    tunnel::{
+        tcp::TcpTunnelListener, udp::UdpTunnelListener, websocket::WSTunnelListener, TunnelListener,
+    },
     utils::{init_logger, setup_panic_handler},
 };
 
@@ -27,7 +29,7 @@ mod web;
 rust_i18n::i18n!("locales", fallback = "en");
 
 #[derive(Parser, Debug)]
-#[command(name = "easytier-core", author, version = EASYTIER_VERSION , about, long_about = None)]
+#[command(name = "easytier-web", author, version = EASYTIER_VERSION , about, long_about = None)]
 struct Cli {
     #[arg(short, long, default_value = "et.db", help = t!("cli.db").to_string())]
     db: String,
@@ -89,12 +91,20 @@ struct Cli {
         default_value = "false"
     )]
     no_web: bool,
+
+    #[cfg(feature = "embed")]
+    #[arg(
+        long,
+        help = t!("cli.api_host").to_string()
+    )]
+    api_host: Option<url::Url>,
 }
 
 pub fn get_listener_by_url(l: &url::Url) -> Result<Box<dyn TunnelListener>, Error> {
     Ok(match l.scheme() {
         "tcp" => Box::new(TcpTunnelListener::new(l.clone())),
         "udp" => Box::new(UdpTunnelListener::new(l.clone())),
+        "ws" => Box::new(WSTunnelListener::new(l.clone())),
         _ => {
             return Err(Error::InvalidUrl(l.to_string()));
         }
@@ -136,36 +146,49 @@ async fn main() {
     let mgr = Arc::new(mgr);
 
     #[cfg(feature = "embed")]
-    let restful_also_serve_web = !cli.no_web
-        && (cli.web_server_port.is_none() || cli.web_server_port == Some(cli.api_server_port));
-
+    let (web_router_restful, web_router_static) = if cli.no_web {
+        (None, None)
+    } else {
+        let web_router = web::build_router(cli.api_host.clone());
+        if cli.web_server_port.is_none() || cli.web_server_port == Some(cli.api_server_port) {
+            (Some(web_router), None)
+        } else {
+            (None, Some(web_router))
+        }
+    };
     #[cfg(not(feature = "embed"))]
-    let restful_also_serve_web = false;
+    let web_router_restful = None;
 
-    let mut restful_server = restful::RestfulServer::new(
+    let _restful_server_tasks = restful::RestfulServer::new(
         format!("0.0.0.0:{}", cli.api_server_port).parse().unwrap(),
         mgr.clone(),
         db,
-        restful_also_serve_web,
+        web_router_restful,
     )
+    .await
+    .unwrap()
+    .start()
     .await
     .unwrap();
 
-    restful_server.start().await.unwrap();
-
     #[cfg(feature = "embed")]
-    let mut web_server = web::WebServer::new(
-        format!("0.0.0.0:{}", cli.web_server_port.unwrap_or(0))
-            .parse()
+    let _web_server_task = if let Some(web_router) = web_router_static {
+        Some(
+            web::WebServer::new(
+                format!("0.0.0.0:{}", cli.web_server_port.unwrap_or(0))
+                    .parse()
+                    .unwrap(),
+                web_router,
+            )
+            .await
+            .unwrap()
+            .start()
+            .await
             .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    #[cfg(feature = "embed")]
-    if !cli.no_web && !restful_also_serve_web {
-        web_server.start().await.unwrap();
-    }
+        )
+    } else {
+        None
+    };
 
     tokio::signal::ctrl_c().await.unwrap();
 }

@@ -2,9 +2,11 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
+    u64,
 };
 
 use anyhow::Context;
+use cidr::IpCidr;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -38,6 +40,9 @@ pub fn gen_default_flags() -> Flags {
         disable_relay_kcp: true,
         accept_dns: false,
         private_mode: false,
+        enable_quic_proxy: false,
+        disable_quic_input: false,
+        foreign_relay_bps_limit: u64::MAX,
     }
 }
 
@@ -61,19 +66,14 @@ pub trait ConfigLoader: Send + Sync {
     fn get_dhcp(&self) -> bool;
     fn set_dhcp(&self, dhcp: bool);
 
-    fn add_proxy_cidr(&self, cidr: cidr::IpCidr);
-    fn remove_proxy_cidr(&self, cidr: cidr::IpCidr);
-    fn get_proxy_cidrs(&self) -> Vec<cidr::IpCidr>;
+    fn add_proxy_cidr(&self, cidr: cidr::Ipv4Cidr, mapped_cidr: Option<cidr::Ipv4Cidr>);
+    fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr);
+    fn get_proxy_cidrs(&self) -> Vec<ProxyNetworkConfig>;
 
     fn get_network_identity(&self) -> NetworkIdentity;
     fn set_network_identity(&self, identity: NetworkIdentity);
 
     fn get_listener_uris(&self) -> Vec<url::Url>;
-
-    fn get_file_logger_config(&self) -> FileLoggerConfig;
-    fn set_file_logger_config(&self, config: FileLoggerConfig);
-    fn get_console_logger_config(&self) -> ConsoleLoggerConfig;
-    fn set_console_logger_config(&self, config: ConsoleLoggerConfig);
 
     fn get_peers(&self) -> Vec<PeerConfig>;
     fn set_peers(&self, peers: Vec<PeerConfig>);
@@ -86,6 +86,9 @@ pub trait ConfigLoader: Send + Sync {
 
     fn get_rpc_portal(&self) -> Option<SocketAddr>;
     fn set_rpc_portal(&self, addr: SocketAddr);
+
+    fn get_rpc_portal_whitelist(&self) -> Option<Vec<IpCidr>>;
+    fn set_rpc_portal_whitelist(&self, whitelist: Option<Vec<IpCidr>>);
 
     fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig>;
     fn set_vpn_portal_config(&self, config: VpnPortalConfig);
@@ -106,6 +109,12 @@ pub trait ConfigLoader: Send + Sync {
     fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>);
 
     fn dump(&self) -> String;
+}
+
+pub trait LoggingConfigLoader {
+    fn get_file_logger_config(&self) -> FileLoggerConfig;
+
+    fn get_console_logger_config(&self) -> ConsoleLoggerConfig;
 }
 
 pub type NetworkSecretDigest = [u8; 32];
@@ -166,7 +175,8 @@ pub struct PeerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ProxyNetworkConfig {
-    pub cidr: String,
+    pub cidr: cidr::Ipv4Cidr,                // the CIDR of the proxy network
+    pub mapped_cidr: Option<cidr::Ipv4Cidr>, // allow remap the proxy CIDR to another CIDR
     pub allow: Option<Vec<String>>,
 }
 
@@ -180,6 +190,24 @@ pub struct FileLoggerConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct ConsoleLoggerConfig {
     pub level: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, derive_builder::Builder)]
+pub struct LoggingConfig {
+    #[builder(setter(into, strip_option), default = None)]
+    file_logger: Option<FileLoggerConfig>,
+    #[builder(setter(into, strip_option), default = None)]
+    console_logger: Option<ConsoleLoggerConfig>,
+}
+
+impl LoggingConfigLoader for &LoggingConfig {
+    fn get_file_logger_config(&self) -> FileLoggerConfig {
+        self.file_logger.clone().unwrap_or_default()
+    }
+
+    fn get_console_logger_config(&self) -> ConsoleLoggerConfig {
+        self.console_logger.clone().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -239,10 +267,8 @@ struct Config {
     peer: Option<Vec<PeerConfig>>,
     proxy_network: Option<Vec<ProxyNetworkConfig>>,
 
-    file_logger: Option<FileLoggerConfig>,
-    console_logger: Option<ConsoleLoggerConfig>,
-
     rpc_portal: Option<SocketAddr>,
+    rpc_portal_whitelist: Option<Vec<IpCidr>>,
 
     vpn_portal_config: Option<VpnPortalConfig>,
 
@@ -397,50 +423,52 @@ impl ConfigLoader for TomlConfigLoader {
         self.config.lock().unwrap().dhcp = Some(dhcp);
     }
 
-    fn add_proxy_cidr(&self, cidr: cidr::IpCidr) {
+    fn add_proxy_cidr(&self, cidr: cidr::Ipv4Cidr, mapped_cidr: Option<cidr::Ipv4Cidr>) {
         let mut locked_config = self.config.lock().unwrap();
         if locked_config.proxy_network.is_none() {
             locked_config.proxy_network = Some(vec![]);
         }
-        let cidr_str = cidr.to_string();
+        if let Some(mapped_cidr) = mapped_cidr.as_ref() {
+            assert_eq!(
+                cidr.network_length(),
+                mapped_cidr.network_length(),
+                "Mapped CIDR must have the same network length as the original CIDR",
+            );
+        }
         // insert if no duplicate
         if !locked_config
             .proxy_network
             .as_ref()
             .unwrap()
             .iter()
-            .any(|c| c.cidr == cidr_str)
+            .any(|c| c.cidr == cidr && c.mapped_cidr == mapped_cidr)
         {
             locked_config
                 .proxy_network
                 .as_mut()
                 .unwrap()
                 .push(ProxyNetworkConfig {
-                    cidr: cidr_str,
+                    cidr,
+                    mapped_cidr,
                     allow: None,
                 });
         }
     }
 
-    fn remove_proxy_cidr(&self, cidr: cidr::IpCidr) {
+    fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr) {
         let mut locked_config = self.config.lock().unwrap();
         if let Some(proxy_cidrs) = &mut locked_config.proxy_network {
-            let cidr_str = cidr.to_string();
-            proxy_cidrs.retain(|c| c.cidr != cidr_str);
+            proxy_cidrs.retain(|c| c.cidr != cidr);
         }
     }
 
-    fn get_proxy_cidrs(&self) -> Vec<cidr::IpCidr> {
+    fn get_proxy_cidrs(&self) -> Vec<ProxyNetworkConfig> {
         self.config
             .lock()
             .unwrap()
             .proxy_network
             .as_ref()
-            .map(|v| {
-                v.iter()
-                    .map(|c| c.cidr.parse().unwrap())
-                    .collect::<Vec<cidr::IpCidr>>()
-            })
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -481,32 +509,6 @@ impl ConfigLoader for TomlConfigLoader {
             .unwrap_or_default()
     }
 
-    fn get_file_logger_config(&self) -> FileLoggerConfig {
-        self.config
-            .lock()
-            .unwrap()
-            .file_logger
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn set_file_logger_config(&self, config: FileLoggerConfig) {
-        self.config.lock().unwrap().file_logger = Some(config);
-    }
-
-    fn get_console_logger_config(&self) -> ConsoleLoggerConfig {
-        self.config
-            .lock()
-            .unwrap()
-            .console_logger
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn set_console_logger_config(&self, config: ConsoleLoggerConfig) {
-        self.config.lock().unwrap().console_logger = Some(config);
-    }
-
     fn get_peers(&self) -> Vec<PeerConfig> {
         self.config.lock().unwrap().peer.clone().unwrap_or_default()
     }
@@ -542,6 +544,14 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_rpc_portal(&self, addr: SocketAddr) {
         self.config.lock().unwrap().rpc_portal = Some(addr);
+    }
+
+    fn get_rpc_portal_whitelist(&self) -> Option<Vec<IpCidr>> {
+        self.config.lock().unwrap().rpc_portal_whitelist.clone()
+    }
+
+    fn set_rpc_portal_whitelist(&self, whitelist: Option<Vec<IpCidr>>) {
+        self.config.lock().unwrap().rpc_portal_whitelist = whitelist;
     }
 
     fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig> {

@@ -4,11 +4,9 @@ use dashmap::DashMap;
 
 use crate::{
     common::{global_ctx::NetworkIdentity, PeerId},
-    proto::{
-        common::PeerFeatureFlag,
-        peer_rpc::{
-            ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey, RouteForeignNetworkInfos,
-        },
+    proto::peer_rpc::{
+        ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey, RouteForeignNetworkInfos,
+        RoutePeerInfo,
     },
 };
 
@@ -95,9 +93,19 @@ pub trait Route {
         Default::default()
     }
 
+    // my peer id in foreign network is different from the one in local network
+    // this function is used to get the peer id in local network
+    async fn get_origin_my_peer_id(
+        &self,
+        _network_name: &str,
+        _foreign_my_peer_id: PeerId,
+    ) -> Option<PeerId> {
+        None
+    }
+
     async fn set_route_cost_fn(&self, _cost_fn: RouteCostCalculator) {}
 
-    async fn get_feature_flag(&self, peer_id: PeerId) -> Option<PeerFeatureFlag>;
+    async fn get_peer_info(&self, peer_id: PeerId) -> Option<RoutePeerInfo>;
 
     async fn get_peer_info_last_update_time(&self) -> std::time::Instant;
 

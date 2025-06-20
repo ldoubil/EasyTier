@@ -66,6 +66,11 @@ message NetworkConfig {
 
     optional bool enable_magic_dns = 42;
     optional bool enable_private_mode = 43;
+
+    repeated string rpc_portal_whitelists = 44;
+
+    optional bool enable_quic_proxy = 45;
+    optional bool disable_quic_input = 46;
 }
 
 message MyNodeInfo {

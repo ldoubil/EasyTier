@@ -1,25 +1,26 @@
 use std::any::Any;
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use anyhow::Context;
-use cidr::Ipv4Inet;
+use cidr::{IpCidr, Ipv4Inet};
 
-use tokio::task::JoinHandle;
 use tokio::{sync::Mutex, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::common::config::ConfigLoader;
 use crate::common::error::Error;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx, GlobalCtxEvent};
+use crate::common::scoped_task::ScopedTask;
 use crate::common::PeerId;
 use crate::connector::direct::DirectConnectorManager;
 use crate::connector::manual::{ConnectorManagerRpcService, ManualConnectorManager};
 use crate::connector::udp_hole_punch::UdpHolePunchConnector;
 use crate::gateway::icmp_proxy::IcmpProxy;
 use crate::gateway::kcp_proxy::{KcpProxyDst, KcpProxyDstRpcService, KcpProxySrc};
+use crate::gateway::quic_proxy::{QUICProxyDst, QUICProxyDstRpcService, QUICProxySrc};
 use crate::gateway::tcp_proxy::{NatDstTcpConnector, TcpProxy, TcpProxyRpcService};
 use crate::gateway::udp_proxy::UdpProxy;
 use crate::peer_center::instance::PeerCenterInstance;
@@ -29,8 +30,9 @@ use crate::peers::rpc_service::PeerManagerRpcService;
 use crate::peers::{create_packet_recv_chan, recv_packet_from_chan, PacketRecvChanReceiver};
 use crate::proto::cli::VpnPortalRpc;
 use crate::proto::cli::{GetVpnPortalInfoRequest, GetVpnPortalInfoResponse, VpnPortalInfo};
+use crate::proto::common::TunnelInfo;
 use crate::proto::peer_rpc::PeerCenterRpcServer;
-use crate::proto::rpc_impl::standalone::StandAloneServer;
+use crate::proto::rpc_impl::standalone::{RpcServerHook, StandAloneServer};
 use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::tcp::TcpTunnelListener;
@@ -69,12 +71,17 @@ impl IpProxy {
     }
 
     async fn start(&self) -> Result<(), Error> {
-        if (self.global_ctx.get_proxy_cidrs().is_empty()
-            || self.global_ctx.proxy_forward_by_system()
+        if (self.global_ctx.config.get_proxy_cidrs().is_empty()
             || self.started.load(Ordering::Relaxed))
             && !self.global_ctx.enable_exit_node()
             && !self.global_ctx.no_tun()
         {
+            return Ok(());
+        }
+
+        // Actually, if this node is enabled as an exit node,
+        // we still can use the system stack to forward packets.
+        if self.global_ctx.proxy_forward_by_system() && !self.global_ctx.no_tun() {
             return Ok(());
         }
 
@@ -112,7 +119,7 @@ impl NicCtx {
 }
 
 struct MagicDnsContainer {
-    dns_runner_task: JoinHandle<()>,
+    dns_runner_task: ScopedTask<()>,
     dns_runner_cancel_token: CancellationToken,
 }
 
@@ -133,7 +140,7 @@ impl NicCtxContainer {
             Self {
                 nic_ctx: Some(Box::new(nic_ctx)),
                 magic_dns: Some(MagicDnsContainer {
-                    dns_runner_task: task,
+                    dns_runner_task: task.into(),
                     dns_runner_cancel_token: token,
                 }),
             }
@@ -155,6 +162,58 @@ impl NicCtxContainer {
 
 type ArcNicCtx = Arc<Mutex<Option<NicCtxContainer>>>;
 
+pub struct InstanceRpcServerHook {
+    rpc_portal_whitelist: Vec<IpCidr>,
+}
+
+impl InstanceRpcServerHook {
+    pub fn new(rpc_portal_whitelist: Option<Vec<IpCidr>>) -> Self {
+        let rpc_portal_whitelist = rpc_portal_whitelist
+            .unwrap_or_else(|| vec!["127.0.0.0/8".parse().unwrap(), "::1/128".parse().unwrap()]);
+        InstanceRpcServerHook {
+            rpc_portal_whitelist,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcServerHook for InstanceRpcServerHook {
+    async fn on_new_client(
+        &self,
+        tunnel_info: Option<TunnelInfo>,
+    ) -> Result<Option<TunnelInfo>, anyhow::Error> {
+        let tunnel_info = tunnel_info.ok_or_else(|| anyhow::anyhow!("tunnel info is None"))?;
+
+        let remote_url = tunnel_info
+            .remote_addr
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote_addr is None"))?;
+
+        let url_str = &remote_url.url;
+        let url = url::Url::parse(url_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse remote URL '{}': {}", url_str, e))?;
+
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("No host found in remote URL '{}'", url_str))?;
+
+        let ip_addr: IpAddr = host
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Failed to parse IP address '{}': {}", host, e))?;
+
+        for cidr in &self.rpc_portal_whitelist {
+            if cidr.contains(&ip_addr) {
+                return Ok(Some(tunnel_info));
+            }
+        }
+        return Err(anyhow::anyhow!(
+            "Rpc portal client IP {} not in whitelist: {:?}, ignoring client.",
+            ip_addr,
+            self.rpc_portal_whitelist
+        ));
+    }
+}
+
 pub struct Instance {
     inst_name: String,
 
@@ -173,6 +232,9 @@ pub struct Instance {
 
     kcp_proxy_src: Option<KcpProxySrc>,
     kcp_proxy_dst: Option<KcpProxyDst>,
+
+    quic_proxy_src: Option<QUICProxySrc>,
+    quic_proxy_dst: Option<QUICProxyDst>,
 
     peer_center: Arc<PeerCenterInstance>,
 
@@ -253,6 +315,9 @@ impl Instance {
             ip_proxy: None,
             kcp_proxy_src: None,
             kcp_proxy_dst: None,
+
+            quic_proxy_src: None,
+            quic_proxy_dst: None,
 
             peer_center,
 
@@ -341,7 +406,7 @@ impl Instance {
     // Warning, if there is an IP conflict in the network when using DHCP, the IP will be automatically changed.
     fn check_dhcp_ip_conflict(&self) {
         use rand::Rng;
-        let peer_manager_c = self.peer_manager.clone();
+        let peer_manager_c = Arc::downgrade(&self.peer_manager.clone());
         let global_ctx_c = self.get_global_ctx();
         let nic_ctx = self.nic_ctx.clone();
         let _peer_packet_receiver = self.peer_packet_receiver.clone();
@@ -351,6 +416,11 @@ impl Instance {
             let mut next_sleep_time = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(next_sleep_time)).await;
+
+                let Some(peer_manager_c) = peer_manager_c.upgrade() else {
+                    tracing::warn!("peer manager is dropped, stop dhcp check.");
+                    return;
+                };
 
                 // do not allocate ip if no peer connected
                 let routes = peer_manager_c.list_routes().await;
@@ -497,6 +567,20 @@ impl Instance {
             let mut dst_proxy = KcpProxyDst::new(self.get_peer_manager()).await;
             dst_proxy.start().await;
             self.kcp_proxy_dst = Some(dst_proxy);
+        }
+
+        if self.global_ctx.get_flags().enable_quic_proxy {
+            let quic_src = QUICProxySrc::new(self.get_peer_manager()).await;
+            quic_src.start().await;
+            self.quic_proxy_src = Some(quic_src);
+        }
+
+        if !self.global_ctx.get_flags().disable_quic_input {
+            let quic_dst = QUICProxyDst::new(self.global_ctx.clone())?;
+            quic_dst.start().await?;
+            self.global_ctx
+                .set_quic_proxy_port(Some(quic_dst.local_addr()?.port()));
+            self.quic_proxy_dst = Some(quic_dst);
         }
 
         // run after tun device created, so listener can bind to tun device, which may be required by win 10
@@ -674,6 +758,24 @@ impl Instance {
             );
         }
 
+        if let Some(quic_proxy) = self.quic_proxy_src.as_ref() {
+            s.registry().register(
+                TcpProxyRpcServer::new(TcpProxyRpcService::new(quic_proxy.get_tcp_proxy())),
+                "quic_src",
+            );
+        }
+
+        if let Some(quic_proxy) = self.quic_proxy_dst.as_ref() {
+            s.registry().register(
+                TcpProxyRpcServer::new(QUICProxyDstRpcService::new(quic_proxy)),
+                "quic_dst",
+            );
+        }
+
+        s.set_hook(Arc::new(InstanceRpcServerHook::new(
+            self.global_ctx.config.get_rpc_portal_whitelist(),
+        )));
+
         let _g = self.global_ctx.net_ns.guard();
         Ok(s.serve().await.with_context(|| "rpc server start failed")?)
     }
@@ -724,5 +826,174 @@ impl Instance {
         };
         Self::use_new_nic_ctx(nic_ctx.clone(), new_nic_ctx, magic_dns_runner).await;
         Ok(())
+    }
+
+    pub async fn clear_resources(&mut self) {
+        self.peer_manager.clear_resources().await;
+        let _ = self.nic_ctx.lock().await.take();
+        if let Some(rpc_server) = self.rpc_server.take() {
+            rpc_server.registry().unregister_all();
+        };
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let my_peer_id = self.peer_manager.my_peer_id();
+        let pm = Arc::downgrade(&self.peer_manager);
+        let nic_ctx = self.nic_ctx.clone();
+        if let Some(rpc_server) = self.rpc_server.take() {
+            rpc_server.registry().unregister_all();
+        };
+        tokio::spawn(async move {
+            nic_ctx.lock().await.take();
+            if let Some(pm) = pm.upgrade() {
+                pm.clear_resources().await;
+            };
+
+            let now = std::time::Instant::now();
+            while now.elapsed().as_secs() < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if pm.strong_count() == 0 {
+                    tracing::info!(
+                        "Instance for peer {} dropped, all resources cleared.",
+                        my_peer_id
+                    );
+                    return;
+                }
+            }
+
+            debug_assert!(
+                false,
+                "Instance for peer {} dropped, but resources not cleared in 1 seconds.",
+                my_peer_id
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        instance::instance::InstanceRpcServerHook, proto::rpc_impl::standalone::RpcServerHook,
+    };
+
+    #[tokio::test]
+    async fn test_rpc_portal_whitelist() {
+        use cidr::IpCidr;
+
+        struct TestCase {
+            remote_url: String,
+            whitelist: Option<Vec<IpCidr>>,
+            expected_result: bool,
+        }
+
+        let test_cases: Vec<TestCase> = vec![
+            // Test default whitelist (127.0.0.0/8, ::1/128)
+            TestCase {
+                remote_url: "tcp://127.0.0.1:15888".to_string(),
+                whitelist: None,
+                expected_result: true,
+            },
+            TestCase {
+                remote_url: "tcp://127.1.2.3:15888".to_string(),
+                whitelist: None,
+                expected_result: true,
+            },
+            TestCase {
+                remote_url: "tcp://192.168.1.1:15888".to_string(),
+                whitelist: None,
+                expected_result: false,
+            },
+            // Test custom whitelist
+            TestCase {
+                remote_url: "tcp://192.168.1.10:15888".to_string(),
+                whitelist: Some(vec![
+                    "192.168.1.0/24".parse().unwrap(),
+                    "10.0.0.0/8".parse().unwrap(),
+                ]),
+                expected_result: true,
+            },
+            TestCase {
+                remote_url: "tcp://10.1.2.3:15888".to_string(),
+                whitelist: Some(vec![
+                    "192.168.1.0/24".parse().unwrap(),
+                    "10.0.0.0/8".parse().unwrap(),
+                ]),
+                expected_result: true,
+            },
+            TestCase {
+                remote_url: "tcp://172.16.0.1:15888".to_string(),
+                whitelist: Some(vec![
+                    "192.168.1.0/24".parse().unwrap(),
+                    "10.0.0.0/8".parse().unwrap(),
+                ]),
+                expected_result: false,
+            },
+            // Test empty whitelist (should reject all connections)
+            TestCase {
+                remote_url: "tcp://127.0.0.1:15888".to_string(),
+                whitelist: Some(vec![]),
+                expected_result: false,
+            },
+            // Test broad whitelist (0.0.0.0/0 and ::/0 accept all IP addresses)
+            TestCase {
+                remote_url: "tcp://8.8.8.8:15888".to_string(),
+                whitelist: Some(vec!["0.0.0.0/0".parse().unwrap()]),
+                expected_result: true,
+            },
+            // Test edge case: specific IP whitelist
+            TestCase {
+                remote_url: "tcp://192.168.1.5:15888".to_string(),
+                whitelist: Some(vec!["192.168.1.5/32".parse().unwrap()]),
+                expected_result: true,
+            },
+            TestCase {
+                remote_url: "tcp://192.168.1.6:15888".to_string(),
+                whitelist: Some(vec!["192.168.1.5/32".parse().unwrap()]),
+                expected_result: false,
+            },
+            // Test invalid URL (this case will fail during URL parsing)
+            TestCase {
+                remote_url: "invalid-url".to_string(),
+                whitelist: None,
+                expected_result: false,
+            },
+            // Test URL without IP address (this case will fail during IP parsing)
+            TestCase {
+                remote_url: "tcp://localhost:15888".to_string(),
+                whitelist: None,
+                expected_result: false,
+            },
+        ];
+
+        for case in test_cases {
+            let hook = InstanceRpcServerHook::new(case.whitelist.clone());
+            let tunnel_info = Some(crate::proto::common::TunnelInfo {
+                remote_addr: Some(crate::proto::common::Url {
+                    url: case.remote_url.clone(),
+                }),
+                ..Default::default()
+            });
+
+            let result = hook.on_new_client(tunnel_info).await;
+            if case.expected_result {
+                assert!(
+                    result.is_ok(),
+                    "Expected success for remote_url:{},whitelist:{:?},but got: {:?}",
+                    case.remote_url,
+                    case.whitelist,
+                    result
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "Expected failure for remote_url:{},whitelist:{:?},but got: {:?}",
+                    case.remote_url,
+                    case.whitelist,
+                    result
+                );
+            }
+        }
     }
 }

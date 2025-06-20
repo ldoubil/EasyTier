@@ -103,6 +103,7 @@ message ListForeignNetworkRequest {}
 message ForeignNetworkEntryPb {
   repeated PeerInfo peers = 1;
   bytes network_secret_digest = 2;
+  uint32 my_peer_id_for_this_network = 3;
 }
 
 message ListForeignNetworkResponse {
@@ -186,6 +187,7 @@ service VpnPortalRpc {
 enum TcpProxyEntryTransportType {
   TCP = 0;
   KCP = 1;
+  QUIC = 2;
 }
 
 enum TcpProxyEntryState {

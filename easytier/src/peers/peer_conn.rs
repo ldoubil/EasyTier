@@ -101,6 +101,9 @@ pub struct PeerConn {
     info: Option<HandshakeRequest>,
     is_client: Option<bool>,
 
+    // remote or local
+    is_hole_punched: bool,
+
     close_event_notifier: Arc<PeerConnCloseNotify>,
 
     ctrl_resp_sender: broadcast::Sender<ZCPacket>,
@@ -152,6 +155,8 @@ impl PeerConn {
             info: None,
             is_client: None,
 
+            is_hole_punched: true,
+
             close_event_notifier: Arc::new(PeerConnCloseNotify::new(conn_id)),
 
             ctrl_resp_sender: ctrl_sender,
@@ -164,6 +169,14 @@ impl PeerConn {
 
     pub fn get_conn_id(&self) -> PeerConnId {
         self.conn_id
+    }
+
+    pub fn set_is_hole_punched(&mut self, is_hole_punched: bool) {
+        self.is_hole_punched = is_hole_punched;
+    }
+
+    pub fn is_hole_punched(&self) -> bool {
+        self.is_hole_punched
     }
 
     async fn wait_handshake(&mut self, need_retry: &mut bool) -> Result<HandshakeRequest, Error> {
@@ -264,6 +277,31 @@ impl PeerConn {
         tokio::task::yield_now().await;
 
         Ok(())
+    }
+
+    #[tracing::instrument(skip(handshake_recved))]
+    pub async fn do_handshake_as_server_ext<Fn>(
+        &mut self,
+        mut handshake_recved: Fn,
+    ) -> Result<(), Error>
+    where
+        Fn: FnMut(&mut Self, &HandshakeRequest) -> Result<(), Error> + Send,
+    {
+        let rsp = self.wait_handshake_loop().await?;
+
+        handshake_recved(self, &rsp)?;
+
+        tracing::info!("handshake request: {:?}", rsp);
+        self.info = Some(rsp);
+        self.is_client = Some(false);
+
+        self.send_handshake().await?;
+
+        if self.get_peer_id() == self.my_peer_id {
+            Err(Error::WaitRespError("peer id conflict".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     #[tracing::instrument]
@@ -434,6 +472,17 @@ impl PeerConn {
             network_name: info.network_name.clone(),
             is_closed: self.close_event_notifier.is_closed(),
         }
+    }
+
+    pub fn set_peer_id(&mut self, peer_id: PeerId) {
+        if self.info.is_some() {
+            panic!("set_peer_id should only be called before handshake");
+        }
+        self.my_peer_id = peer_id;
+    }
+
+    pub fn get_my_peer_id(&self) -> PeerId {
+        self.my_peer_id
     }
 }
 

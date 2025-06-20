@@ -23,7 +23,7 @@ use crate::{
         compressor::{Compressor as _, DefaultCompressor},
         constants::EASYTIER_VERSION,
         error::Error,
-        global_ctx::{ArcGlobalCtx, GlobalCtxEvent, NetworkIdentity},
+        global_ctx::{ArcGlobalCtx, NetworkIdentity},
         stun::StunInfoCollectorTrait,
         PeerId,
     },
@@ -142,8 +142,7 @@ pub struct PeerManager {
 
     exit_nodes: Vec<Ipv4Addr>,
 
-    // conns that are directly connected (which are not hole punched)
-    directly_connected_conn_map: Arc<DashMap<PeerId, DashSet<uuid::Uuid>>>,
+    reserved_my_peer_id_map: DashMap<String, PeerId>,
 }
 
 impl Debug for PeerManager {
@@ -271,7 +270,7 @@ impl PeerManager {
 
             exit_nodes,
 
-            directly_connected_conn_map: Arc::new(DashMap::new()),
+            reserved_my_peer_id_map: DashMap::new(),
         }
     }
 
@@ -315,8 +314,10 @@ impl PeerManager {
     pub async fn add_client_tunnel(
         &self,
         tunnel: Box<dyn Tunnel>,
+        is_directly_connected: bool,
     ) -> Result<(PeerId, PeerConnId), Error> {
         let mut peer = PeerConn::new(self.my_peer_id, self.global_ctx.clone(), tunnel);
+        peer.set_is_hole_punched(!is_directly_connected);
         peer.do_handshake_as_client().await?;
         let conn_id = peer.get_conn_id();
         let peer_id = peer.get_peer_id();
@@ -330,72 +331,12 @@ impl PeerManager {
         Ok((peer_id, conn_id))
     }
 
-    fn add_directly_connected_conn(&self, peer_id: PeerId, conn_id: uuid::Uuid) {
-        let _ = self
-            .directly_connected_conn_map
-            .entry(peer_id)
-            .or_insert_with(DashSet::new)
-            .insert(conn_id);
-    }
-
     pub fn has_directly_connected_conn(&self, peer_id: PeerId) -> bool {
-        self.directly_connected_conn_map
-            .get(&peer_id)
-            .map_or(false, |x| !x.is_empty())
-    }
-
-    async fn start_peer_conn_close_event_handler(&self) {
-        let dmap = self.directly_connected_conn_map.clone();
-        let mut event_recv = self.global_ctx.subscribe();
-        let peer_map = self.peers.clone();
-        use tokio::sync::broadcast::error::RecvError;
-        self.tasks.lock().await.spawn(async move {
-            loop {
-                match event_recv.recv().await {
-                    Err(RecvError::Closed) => {
-                        tracing::error!("peer conn close event handler exit");
-                        break;
-                    }
-                    Err(RecvError::Lagged(_)) => {
-                        tracing::warn!("peer conn close event handler lagged");
-                        event_recv = event_recv.resubscribe();
-                        let alive_conns = peer_map.get_alive_conns();
-                        for p in dmap.iter_mut() {
-                            p.retain(|x| alive_conns.contains_key(&(*p.key(), *x)));
-                        }
-                        dmap.retain(|_, v| !v.is_empty());
-                    }
-                    Ok(event) => {
-                        if let GlobalCtxEvent::PeerConnRemoved(info) = event {
-                            let mut need_remove = false;
-                            if let Some(set) = dmap.get_mut(&info.peer_id) {
-                                let conn_id = info.conn_id.parse().unwrap();
-                                let old = set.remove(&conn_id);
-                                tracing::info!(
-                                    ?old,
-                                    ?info,
-                                    "try remove conn id from directly connected map"
-                                );
-                                need_remove = set.is_empty();
-                            }
-
-                            if need_remove {
-                                dmap.remove(&info.peer_id);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    pub async fn add_direct_tunnel(
-        &self,
-        t: Box<dyn Tunnel>,
-    ) -> Result<(PeerId, PeerConnId), Error> {
-        let (peer_id, conn_id) = self.add_client_tunnel(t).await?;
-        self.add_directly_connected_conn(peer_id, conn_id);
-        Ok((peer_id, conn_id))
+        if let Some(peer) = self.peers.get_peer_by_id(peer_id) {
+            peer.has_directly_connected_conn()
+        } else {
+            false
+        }
     }
 
     #[tracing::instrument]
@@ -410,10 +351,10 @@ impl PeerManager {
         let t = ns
             .run_async(|| async move { connector.connect().await })
             .await?;
-        self.add_direct_tunnel(t).await
+        self.add_client_tunnel(t, true).await
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(ret)]
     pub async fn add_tunnel_as_server(
         &self,
         tunnel: Box<dyn Tunnel>,
@@ -421,32 +362,57 @@ impl PeerManager {
     ) -> Result<(), Error> {
         tracing::info!("add tunnel as server start");
         let mut peer = PeerConn::new(self.my_peer_id, self.global_ctx.clone(), tunnel);
-        peer.do_handshake_as_server().await?;
-        if self.global_ctx.config.get_flags().private_mode
-            && peer.get_network_identity().network_name
-                != self.global_ctx.get_network_identity().network_name
-        {
-            return Err(Error::SecretKeyError(
-                "private mode is turned on, network identity not match".to_string(),
-            ));
-        }
-        if peer.get_network_identity().network_name
-            == self.global_ctx.get_network_identity().network_name
-        {
-            let (peer_id, conn_id) = (peer.get_peer_id(), peer.get_conn_id());
-            self.add_new_peer_conn(peer).await?;
-            if is_directly_connected {
-                self.add_directly_connected_conn(peer_id, conn_id);
+        peer.do_handshake_as_server_ext(|peer, msg| {
+            if msg.network_name
+                == self.global_ctx.get_network_identity().network_name
+            {
+                return Ok(());
             }
+
+            if self.global_ctx.config.get_flags().private_mode {
+                return Err(Error::SecretKeyError(
+                    "private mode is turned on, network identity not match".to_string(),
+                ));
+            }
+
+            let mut peer_id = self
+                .foreign_network_manager
+                .get_network_peer_id(&msg.network_name);
+            if peer_id.is_none() {
+                peer_id = Some(*self.reserved_my_peer_id_map.entry(msg.network_name.clone()).or_insert_with(|| {
+                    rand::random::<PeerId>()
+                }).value());
+            }
+            peer.set_peer_id(peer_id.clone().unwrap());
+
+            tracing::info!(
+                ?peer_id,
+                ?msg.network_name,
+                "handshake as server with foreign network, new peer id: {}, peer id in foreign manager: {:?}",
+                peer.get_my_peer_id(), peer_id
+            );
+
+            Ok(())
+        })
+        .await?;
+
+        let peer_network_name = peer.get_network_identity().network_name.clone();
+
+        if peer_network_name == self.global_ctx.get_network_identity().network_name {
+            peer.set_is_hole_punched(!is_directly_connected);
+            self.add_new_peer_conn(peer).await?;
         } else {
             self.foreign_network_manager.add_peer_conn(peer).await?;
         }
+
+        self.reserved_my_peer_id_map.remove(&peer_network_name);
+
         tracing::info!("add tunnel as server done");
         Ok(())
     }
 
     async fn try_handle_foreign_network_packet(
-        packet: ZCPacket,
+        mut packet: ZCPacket,
         my_peer_id: PeerId,
         peer_map: &PeerMap,
         foreign_network_mgr: &ForeignNetworkManager,
@@ -463,6 +429,10 @@ impl PeerManager {
         let foreign_network_name = foreign_hdr.get_network_name(packet.payload());
         let foreign_peer_id = foreign_hdr.get_dst_peer_id();
 
+        let foreign_network_my_peer_id =
+            foreign_network_mgr.get_network_peer_id(&foreign_network_name);
+
+        // NOTICE: the to peer id is modified by the src from foreign network my peer id to the origin my peer id
         if to_peer_id == my_peer_id {
             // packet sent from other peer to me, extract the inner packet and forward it
             if let Err(e) = foreign_network_mgr
@@ -481,7 +451,27 @@ impl PeerManager {
                 );
             }
             Ok(())
-        } else if from_peer_id == my_peer_id {
+        } else if Some(from_peer_id) == foreign_network_my_peer_id {
+            // to_peer_id is my peer id for the foreign network, need to convert to the origin my_peer_id of dst
+            let Some(to_peer_id) = peer_map
+                .get_origin_my_peer_id(&foreign_network_name, to_peer_id)
+                .await
+            else {
+                tracing::debug!(
+                    ?foreign_network_name,
+                    ?to_peer_id,
+                    "cannot find origin my peer id for foreign network."
+                );
+                return Err(packet);
+            };
+
+            // modify the to_peer id from foreign network my peer id to the origin my peer id
+            packet
+                .mut_peer_manager_header()
+                .unwrap()
+                .to_peer_id
+                .set(to_peer_id);
+
             // packet is generated from foreign network mgr and should be forward to other peer
             if let Err(e) = peer_map
                 .send_msg(packet, to_peer_id, NextHopPolicy::LeastHop)
@@ -496,7 +486,7 @@ impl PeerManager {
 
             Ok(())
         } else {
-            // target is not me, forward it
+            // target is not me, forward it. try get origin peer id
             Err(packet)
         }
     }
@@ -717,6 +707,7 @@ impl PeerManager {
                             last_update: Some(last_update.into()),
                             version: 0,
                             network_secret_digest: info.network_secret_digest.clone(),
+                            my_peer_id_for_this_network: info.my_peer_id_for_this_network,
                         },
                     );
                 }
@@ -963,11 +954,9 @@ impl PeerManager {
 
     async fn run_clean_peer_without_conn_routine(&self) {
         let peer_map = self.peers.clone();
-        let dmap = self.directly_connected_conn_map.clone();
         self.tasks.lock().await.spawn(async move {
             loop {
                 peer_map.clean_peer_without_conn().await;
-                dmap.retain(|p, v| peer_map.has_peer(*p) && !v.is_empty());
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
         });
@@ -984,8 +973,6 @@ impl PeerManager {
     }
 
     pub async fn run(&self) -> Result<(), Error> {
-        self.start_peer_conn_close_event_handler().await;
-
         match &self.route_algo_inst {
             RouteAlgoInst::Ospf(route) => self.add_route(route.clone()).await,
             RouteAlgoInst::None => {}
@@ -1044,9 +1031,16 @@ impl PeerManager {
                 .unwrap_or_default(),
             proxy_cidrs: self
                 .global_ctx
+                .config
                 .get_proxy_cidrs()
                 .into_iter()
-                .map(|x| x.to_string())
+                .map(|x| {
+                    if x.mapped_cidr.is_none() {
+                        x.cidr.to_string()
+                    } else {
+                        format!("{}->{}", x.cidr, x.mapped_cidr.unwrap())
+                    }
+                })
                 .collect(),
             hostname: self.global_ctx.get_hostname(),
             stun_info: Some(self.global_ctx.get_stun_info_collector().get_stun_info()),
@@ -1071,10 +1065,20 @@ impl PeerManager {
     }
 
     pub fn get_directly_connections(&self, peer_id: PeerId) -> DashSet<uuid::Uuid> {
-        self.directly_connected_conn_map
-            .get(&peer_id)
-            .map(|x| x.clone())
-            .unwrap_or_default()
+        if let Some(peer) = self.peers.get_peer_by_id(peer_id) {
+            return peer.get_directly_connections();
+        }
+
+        DashSet::new()
+    }
+
+    pub async fn clear_resources(&self) {
+        let mut peer_pipeline = self.peer_packet_process_pipeline.write().await;
+        peer_pipeline.clear();
+        let mut nic_pipeline = self.nic_packet_process_pipeline.write().await;
+        nic_pipeline.clear();
+
+        self.peer_rpc_mgr.rpc_server().registry().unregister_all();
     }
 }
 
@@ -1154,7 +1158,7 @@ mod tests {
         });
 
         server_mgr
-            .add_client_tunnel(server.accept().await.unwrap())
+            .add_client_tunnel(server.accept().await.unwrap(), false)
             .await
             .unwrap();
     }
@@ -1359,7 +1363,7 @@ mod tests {
 
         let a_mgr_copy = peer_mgr_a.clone();
         tokio::spawn(async move {
-            a_mgr_copy.add_client_tunnel(a_ring).await.unwrap();
+            a_mgr_copy.add_client_tunnel(a_ring, false).await.unwrap();
         });
         let b_mgr_copy = peer_mgr_b.clone();
         tokio::spawn(async move {

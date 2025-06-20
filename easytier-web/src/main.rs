@@ -8,9 +8,10 @@ use std::sync::Arc;
 use clap::Parser;
 use easytier::{
     common::{
-        config::{ConfigLoader, ConsoleLoggerConfig, FileLoggerConfig, TomlConfigLoader},
+        config::{ConsoleLoggerConfig, FileLoggerConfig, LoggingConfigLoader},
         constants::EASYTIER_VERSION,
         error::Error,
+        network::{local_ipv4, local_ipv6},
     },
     tunnel::{
         tcp::TcpTunnelListener, udp::UdpTunnelListener, websocket::WSTunnelListener, TunnelListener,
@@ -100,6 +101,22 @@ struct Cli {
     api_host: Option<url::Url>,
 }
 
+impl LoggingConfigLoader for &Cli {
+    fn get_console_logger_config(&self) -> ConsoleLoggerConfig {
+        ConsoleLoggerConfig {
+            level: self.console_log_level.clone(),
+        }
+    }
+
+    fn get_file_logger_config(&self) -> FileLoggerConfig {
+        FileLoggerConfig {
+            dir: self.file_log_dir.clone(),
+            level: self.file_log_level.clone(),
+            file: None,
+        }
+    }
+}
+
 pub fn get_listener_by_url(l: &url::Url) -> Result<Box<dyn TunnelListener>, Error> {
     Ok(match l.scheme() {
         "tcp" => Box::new(TcpTunnelListener::new(l.clone())),
@@ -111,6 +128,31 @@ pub fn get_listener_by_url(l: &url::Url) -> Result<Box<dyn TunnelListener>, Erro
     })
 }
 
+async fn get_dual_stack_listener(
+    protocol: &str,
+    port: u16,
+) -> Result<
+    (
+        Option<Box<dyn TunnelListener>>,
+        Option<Box<dyn TunnelListener>>,
+    ),
+    Error,
+> {
+    let is_protocol_support_dual_stack =
+        protocol.trim().to_lowercase() == "tcp" || protocol.trim().to_lowercase() == "udp";
+    let v6_listener = if is_protocol_support_dual_stack && local_ipv6().await.is_ok() {
+        get_listener_by_url(&format!("{}://[::0]:{}", protocol, port).parse().unwrap()).ok()
+    } else {
+        None
+    };
+    let v4_listener = if let Ok(_) = local_ipv4().await {
+        get_listener_by_url(&format!("{}://0.0.0.0:{}", protocol, port).parse().unwrap()).ok()
+    } else {
+        None
+    };
+    Ok((v6_listener, v4_listener))
+}
+
 #[tokio::main]
 async fn main() {
     let locale = sys_locale::get_locale().unwrap_or_else(|| String::from("en-US"));
@@ -118,31 +160,25 @@ async fn main() {
     setup_panic_handler();
 
     let cli = Cli::parse();
-    let config = TomlConfigLoader::default();
-    config.set_console_logger_config(ConsoleLoggerConfig {
-        level: cli.console_log_level,
-    });
-    config.set_file_logger_config(FileLoggerConfig {
-        dir: cli.file_log_dir,
-        level: cli.file_log_level,
-        file: None,
-    });
-    init_logger(config, false).unwrap();
+    init_logger(&cli, false).unwrap();
 
     // let db = db::Db::new(":memory:").await.unwrap();
     let db = db::Db::new(cli.db).await.unwrap();
-
-    let listener = get_listener_by_url(
-        &format!(
-            "{}://0.0.0.0:{}",
-            cli.config_server_protocol, cli.config_server_port
-        )
-        .parse()
-        .unwrap(),
-    )
-    .unwrap();
     let mut mgr = client_manager::ClientManager::new(db.clone());
-    mgr.serve(listener).await.unwrap();
+    let (v6_listener, v4_listener) =
+        get_dual_stack_listener(&cli.config_server_protocol, cli.config_server_port)
+            .await
+            .unwrap();
+    if v4_listener.is_none() && v6_listener.is_none() {
+        panic!("Listen to both IPv4 and IPv6 failed");
+    }
+    if let Some(listener) = v6_listener {
+        mgr.add_listener(listener).await.unwrap();
+    }
+    if let Some(listener) = v4_listener {
+        mgr.add_listener(listener).await.unwrap();
+    }
+
     let mgr = Arc::new(mgr);
 
     #[cfg(feature = "embed")]

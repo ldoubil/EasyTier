@@ -22,6 +22,8 @@ message RoutePeerInfo {
   uint64 peer_route_id = 12;
 
   uint32 network_length = 13;
+
+  optional uint32 quic_port = 14;
 }
 
 message PeerIdVersion {
@@ -46,6 +48,7 @@ message ForeignNetworkRouteInfoEntry {
   google.protobuf.Timestamp last_update = 2;
   uint32 version = 3;
   bytes network_secret_digest = 4;
+  uint32 my_peer_id_for_this_network = 5;
 }
 
 message RouteForeignNetworkInfos {

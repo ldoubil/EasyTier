@@ -18,6 +18,7 @@ advanced_settings: 高级设置
 basic_settings: 基础设置
 listener_urls: 监听地址
 rpc_port: RPC端口
+rpc_portal_whitelists: RPC白名单
 config_network: 配置网络
 running: 运行中
 error_msg: 错误信息
@@ -50,7 +51,11 @@ dev_name_placeholder: 注意：当多个网络同时使用相同的TUN接口名�
 off_text: 点击关闭
 on_text: 点击开启
 show_config: 显示配置
+edit_config: 编辑配置文件
+config_file: 配置文件
 close: 关闭
+save: 保存
+config_saved: 配置已保存
 
 use_latency_first: 延迟优先模式
 my_node_info: 当前节点信息
@@ -83,6 +88,12 @@ enable_kcp_proxy_help: 将 TCP 流量转为 KCP 流量，降低传输延迟，�
 
 disable_kcp_input: 禁用 KCP 输入
 disable_kcp_input_help: 禁用 KCP 入站流量，其他开启 KCP 代理的节点仍然使用 TCP 连接到本节点。
+
+enable_quic_proxy: 启用 QUIC 代理
+enable_quic_proxy_help: 将 TCP 流量转为 QUIC 流量，降低传输延迟，提升传输速度。
+
+disable_quic_input: 禁用 QUIC 输入
+disable_quic_input_help: 禁用 QUIC 入站流量，其他开启 QUIC 代理的节点仍然使用 TCP 连接到本节点。
 
 disable_p2p: 禁用 P2P
 disable_p2p_help: 禁用 P2P 模式，所有流量通过手动指定的服务器中转。

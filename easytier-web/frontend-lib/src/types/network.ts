@@ -39,6 +39,8 @@ export interface NetworkConfig {
   use_smoltcp?: boolean
   enable_kcp_proxy?: boolean
   disable_kcp_input?: boolean
+  enable_quic_proxy?: boolean
+  disable_quic_input?: boolean
   disable_p2p?: boolean
   bind_device?: boolean
   no_tun?: boolean
@@ -65,6 +67,8 @@ export interface NetworkConfig {
 
   enable_magic_dns?: boolean
   enable_private_mode?: boolean
+
+  rpc_portal_whitelists: string[]
 }
 
 export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
@@ -103,6 +107,8 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     use_smoltcp: false,
     enable_kcp_proxy: false,
     disable_kcp_input: false,
+    enable_quic_proxy: false,
+    disable_quic_input: false,
     disable_p2p: false,
     bind_device: true,
     no_tun: false,
@@ -123,6 +129,7 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     mapped_listeners: [],
     enable_magic_dns: false,
     enable_private_mode: false,
+    rpc_portal_whitelists: [],
   }
 }
 

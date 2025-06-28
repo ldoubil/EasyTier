@@ -278,6 +278,13 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_MULTI_THREAD_COUNT",
+        help = t!("core_clap.multi_thread_count").to_string(),
+    )]
+    multi_thread_count: Option<u32>,
+
+    #[arg(
+        long,
         env = "ET_DISABLE_IPV6",
         help = t!("core_clap.disable_ipv6").to_string(),
         num_args = 0..=1,
@@ -670,7 +677,13 @@ impl NetworkOptions {
         };
         cfg.set_rpc_portal(rpc_portal);
 
-        cfg.set_rpc_portal_whitelist(self.rpc_portal_whitelist.clone());
+        if let Some(rpc_portal_whitelist) = &self.rpc_portal_whitelist {
+            let mut whitelist = cfg.get_rpc_portal_whitelist().unwrap_or_else(|| Vec::new());
+            for cidr in rpc_portal_whitelist {
+                whitelist.push((*cidr).clone());
+            }
+            cfg.set_rpc_portal_whitelist(Some(whitelist));
+        }
 
         if let Some(external_nodes) = self.external_node.as_ref() {
             let mut old_peers = cfg.get_peers();
@@ -813,6 +826,7 @@ impl NetworkOptions {
         f.foreign_relay_bps_limit = self
             .foreign_relay_bps_limit
             .unwrap_or(f.foreign_relay_bps_limit);
+        f.multi_thread_count = self.multi_thread_count.unwrap_or(f.multi_thread_count);
         cfg.set_flags(f);
 
         if !self.exit_nodes.is_empty() {

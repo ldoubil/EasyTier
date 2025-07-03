@@ -2038,6 +2038,7 @@ dependencies = [
  "tabled",
  "tachyonix",
  "thiserror 1.0.63",
+ "thunk-rs",
  "time",
  "timedmap",
  "tokio",

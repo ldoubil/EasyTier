@@ -1322,15 +1322,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
-name = "convert_case"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb402b8d4c85569410425650ce3eddc7d698ed96d39a73f941b08fb63082f1e7"
-dependencies = [
- "unicode-segmentation",
-]
-
-[[package]]
 name = "cookie"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1797,7 +1788,7 @@ version = "0.99.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f33878137e4dafd7fa914ad4e259e18a4e8e532b9617a2d0150262bf53abfce"
 dependencies = [
- "convert_case 0.4.0",
+ "convert_case",
  "proc-macro2",
  "quote",
  "rustc_version",
@@ -2058,8 +2049,10 @@ dependencies = [
  "version-compare",
  "which 7.0.3",
  "wildmatch",
+ "winapi",
  "windows 0.52.0",
  "windows-service",
+ "windows-sys 0.52.0",
  "winreg 0.52.0",
  "zerocopy",
  "zip",
@@ -2087,9 +2080,9 @@ dependencies = [
  "dashmap",
  "dunce",
  "easytier",
+ "elevated-command",
  "gethostname 0.5.0",
  "once_cell",
- "privilege",
  "serde",
  "serde_json",
  "tauri",
@@ -2104,23 +2097,6 @@ dependencies = [
  "tauri-plugin-vpnservice",
  "thunk-rs",
  "tokio",
- "uuid",
-]
-
-[[package]]
-name = "easytier-ohrs"
-version = "0.1.0"
-dependencies = [
- "easytier",
- "napi-build-ohos",
- "napi-derive-ohos",
- "napi-ohos",
- "ohos-hilog-binding",
- "once_cell",
- "serde_json",
- "tracing",
- "tracing-core",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2190,6 +2166,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60b1af1c220855b6ceac025d3f6ecdd2b7c4894bfe9cd9bda4fbb4bc7c0d4cf0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "elevated-command"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54c410eccdcc5b759704fdb6a792afe6b01ab8a062e2c003ff2567e2697a94aa"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "libc",
+ "log",
+ "winapi",
+ "windows 0.52.0",
 ]
 
 [[package]]
@@ -4144,7 +4134,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -4534,67 +4524,6 @@ dependencies = [
  "num-traits",
  "simba",
  "typenum",
-]
-
-[[package]]
-name = "napi-build-ohos"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ad5bf214216afe5b572da0bcd5cab932d17cbcca3dbe82991db0d765a764c8a"
-
-[[package]]
-name = "napi-derive-backend-ohos"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd974d6316c670078fa15276c6134e5b45142b393db350b24682ae613733cdac"
-dependencies = [
- "convert_case 0.7.1",
- "once_cell",
- "proc-macro2",
- "quote",
- "semver",
- "syn 2.0.87",
-]
-
-[[package]]
-name = "napi-derive-ohos"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3a8b89bbc39f81c472e76813dcd837f311aae7850a24a01d0bf5858221b1fd2"
-dependencies = [
- "convert_case 0.7.1",
- "napi-derive-backend-ohos",
- "proc-macro2",
- "quote",
- "syn 2.0.87",
-]
-
-[[package]]
-name = "napi-ohos"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32036ede4ef064610304337831e9d49dac23e7edc4e9efd076c8259eab6d19a9"
-dependencies = [
- "bitflags 2.8.0",
- "chrono",
- "ctor",
- "encoding_rs",
- "futures-core",
- "indexmap 2.7.1",
- "napi-sys-ohos",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "napi-sys-ohos"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e18642400316f886a6f153b2fbc48f5652d0e117803057005f89f0e48217d64"
-dependencies = [
- "libloading 0.8.5",
 ]
 
 [[package]]
@@ -5214,22 +5143,6 @@ checksum = "27b64972346851a39438c60b341ebc01bba47464ae329e55cf343eb93964efd9"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "ohos-hilog-binding"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f360d22e965a34286283d36e8864fdfb04f443697641e8f6cbd64e670c3a3d5"
-dependencies = [
- "libc",
- "ohos-hilogs-sys",
-]
-
-[[package]]
-name = "ohos-hilogs-sys"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed07615005d0f8d7bcf901f89c8ff4870666a9bdb00382f588af383f40c160b7"
 
 [[package]]
 name = "once_cell"
@@ -5931,18 +5844,6 @@ checksum = "5f12335488a2f3b0a83b14edad48dca9879ce89b2edd10e80237e4e852dd645e"
 dependencies = [
  "proc-macro2",
  "syn 2.0.87",
-]
-
-[[package]]
-name = "privilege"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "765ec92721e112ffe07f5c06fb0654da0b708990888981d05cf12a7c9909df30"
-dependencies = [
- "libc",
- "security-framework-sys",
- "which 4.4.2",
- "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -8606,8 +8507,8 @@ dependencies = [
 
 [[package]]
 name = "thunk-rs"
-version = "0.3.3"
-source = "git+https://github.com/easytier/thunk.git#5e8371a3100dbc18dda952a2036c6bd6fb0504db"
+version = "0.3.4"
+source = "git+https://github.com/easytier/thunk.git#403f0d26d3d5bcfdfd76c23e36e517f19fe891e0"
 
 [[package]]
 name = "tiff"
@@ -9798,7 +9699,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

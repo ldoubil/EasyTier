@@ -149,6 +149,13 @@ struct NetworkOptions {
     ipv4: Option<String>,
 
     #[arg(
+        long,
+        env = "ET_IPV6",
+        help = t!("core_clap.ipv6").to_string()
+    )]
+    ipv6: Option<String>,
+
+    #[arg(
         short,
         long,
         env = "ET_DHCP",
@@ -615,6 +622,12 @@ impl NetworkOptions {
             })?))
         }
 
+        if let Some(ipv6) = &self.ipv6 {
+            cfg.set_ipv6(Some(ipv6.parse().with_context(|| {
+                format!("failed to parse ipv6 address: {}", ipv6)
+            })?))
+        }
+
         if !self.peers.is_empty() {
             let mut peers = cfg.get_peers();
             peers.reserve(peers.len() + self.peers.len());
@@ -645,6 +658,7 @@ impl NetworkOptions {
         }
 
         if !self.mapped_listeners.is_empty() {
+            let mut errs = Vec::new();
             cfg.set_mapped_listeners(Some(
                 self.mapped_listeners
                     .iter()
@@ -655,12 +669,21 @@ impl NetworkOptions {
                     })
                     .map(|s: url::Url| {
                         if s.port().is_none() {
-                            panic!("mapped listener port is missing: {}", s);
+                            errs.push(anyhow::anyhow!("mapped listener port is missing: {}", s));
                         }
                         s
                     })
-                    .collect(),
+                    .collect::<Vec<_>>(),
             ));
+            if !errs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "{}",
+                    errs.iter()
+                        .map(|x| format!("{}", x))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
         }
 
         for n in self.proxy_networks.iter() {
@@ -787,6 +810,7 @@ impl NetworkOptions {
         if let Some(dev_name) = &self.dev_name {
             f.dev_name = dev_name.clone()
         }
+        println!("mtu: {}, {:?}", f.mtu, self.mtu);
         if let Some(mtu) = self.mtu {
             f.mtu = mtu as u32;
         }

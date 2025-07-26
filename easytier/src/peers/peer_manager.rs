@@ -8,7 +8,7 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 
 use tokio::{
     sync::{
@@ -81,12 +81,14 @@ impl PeerRpcManagerTransport for RpcTransport {
 
     async fn send(&self, mut msg: ZCPacket, dst_peer_id: PeerId) -> Result<(), Error> {
         let peers = self.peers.upgrade().ok_or(Error::Unknown)?;
-        // NOTE: if route info is not exchanged, this will return error. treat it as need relay
-        if !peers
-            .need_relay_by_foreign_network(dst_peer_id)
+        // NOTE: if route info is not exchanged, this will return None. treat it as public server.
+        let is_dst_peer_public_server = peers
+            .get_route_peer_info(dst_peer_id)
             .await
-            .unwrap_or(true)
-        {
+            .and_then(|x| x.feature_flag.map(|x| x.is_public_server))
+            // if dst is directly connected, it's must not public server
+            .unwrap_or(!peers.has_peer(dst_peer_id));
+        if !is_dst_peer_public_server {
             self.encryptor
                 .encrypt(&mut msg)
                 .with_context(|| "encrypt failed")?;
@@ -573,6 +575,8 @@ impl PeerManager {
         let foreign_mgr = self.foreign_network_manager.clone();
         let encryptor = self.encryptor.clone();
         let compress_algo = self.data_compress_algo;
+        let acl_filter = self.global_ctx.get_acl_filter().clone();
+        let global_ctx = self.global_ctx.clone();
         self.tasks.lock().await.spawn(async move {
             tracing::trace!("start_peer_recv");
             while let Ok(ret) = recv_packet_from_chan(&mut recv).await {
@@ -628,6 +632,15 @@ impl PeerManager {
                     let compressor = DefaultCompressor {};
                     if let Err(e) = compressor.decompress(&mut ret).await {
                         tracing::error!(?e, "decompress failed");
+                        continue;
+                    }
+
+                    if !acl_filter.process_packet_with_acl(
+                        &ret,
+                        true,
+                        global_ctx.get_ipv4().map(|x| x.address()),
+                        global_ctx.get_ipv6().map(|x| x.address()),
+                    ) {
                         continue;
                     }
 
@@ -845,6 +858,14 @@ impl PeerManager {
     }
 
     async fn run_nic_packet_process_pipeline(&self, data: &mut ZCPacket) {
+        if !self
+            .global_ctx
+            .get_acl_filter()
+            .process_packet_with_acl(data, false, None, None)
+        {
+            return;
+        }
+
         for pipeline in self.nic_packet_process_pipeline.read().await.iter().rev() {
             let _ = pipeline.try_process_packet_from_nic(data).await;
         }
@@ -1182,14 +1203,6 @@ impl PeerManager {
         while !self.tasks.lock().await.is_empty() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-    }
-
-    pub fn get_directly_connections(&self, peer_id: PeerId) -> DashSet<uuid::Uuid> {
-        if let Some(peer) = self.peers.get_peer_by_id(peer_id) {
-            return peer.get_directly_connections();
-        }
-
-        DashSet::new()
     }
 
     pub async fn clear_resources(&self) {

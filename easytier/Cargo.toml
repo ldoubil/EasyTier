@@ -3,12 +3,12 @@ name = "easytier"
 description = "A full meshed p2p VPN, connecting all your devices in one network with one command."
 homepage = "https://github.com/EasyTier/EasyTier"
 repository = "https://github.com/EasyTier/EasyTier"
-version = "2.3.2"
+version = "2.4.0"
 edition = "2021"
 authors = ["kkrainbow"]
 keywords = ["vpn", "p2p", "network", "easytier"]
 categories = ["network-programming", "command-line-utilities"]
-rust-version = "1.84.0"
+rust-version = "1.87.0"
 license-file = "LICENSE"
 readme = "README.md"
 
@@ -40,6 +40,7 @@ tracing-appender = "0.2.3"
 thiserror = "1.0"
 auto_impl = "1.1.0"
 crossbeam = "0.8.4"
+arc-swap = "1.7"
 time = "0.3"
 toml = "0.8.12"
 chrono = { version = "0.4.37", features = ["serde"] }
@@ -89,7 +90,7 @@ tun = { package = "tun-easytier", git="https://github.com/EasyTier/rust-tun", fe
     "async",
 ], optional = true }
 # for net ns
-nix = { version = "0.29.0", features = ["sched", "socket", "ioctl", "net"] }
+nix = { version = "0.29.0", features = ["sched", "socket", "ioctl", "net", "fs"] }
 
 uuid = { version = "1.5.0", features = [
     "v4",
@@ -190,7 +191,7 @@ service-manager = { git = "https://github.com/chipsenkbeil/service-manager-rs.gi
 
 zstd = { version = "0.13" }
 
-kcp-sys = { git = "https://github.com/EasyTier/kcp-sys" }
+kcp-sys = { git = "https://github.com/EasyTier/kcp-sys", rev = "0f0a0558391ba391c089806c23f369651f6c9eeb" }
 
 prost-reflect = { version = "0.14.5", default-features = false, features = [
     "derive",
@@ -212,14 +213,6 @@ derive_builder = "0.20.2"
 humantime-serde = "1.1.1"
 multimap = "0.10.0"
 version-compare = "0.2.0"
-
-jemallocator = { version = "0.5.4", optional = true }
-jemalloc-ctl = { version = "0.5.4", optional = true }
-jemalloc-sys = { version = "0.5.4", features = [
-    "stats",
-    "profiling",
-    "unprefixed_malloc_on_supported_platforms",
-], optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "freebsd"))'.dependencies]
 machine-uid = "0.5.3"
@@ -255,6 +248,15 @@ windows-sys = { version = "0.52", features = [
 ]}
 winapi = { version = "0.3.9", features = ["impl-default"] }
 
+[target.'cfg(not(windows))'.dependencies]
+jemallocator = { package = "tikv-jemallocator", version = "0.6.0", optional = true }
+jemalloc-ctl = { package = "tikv-jemalloc-ctl", version = "0.6.0", optional = true, features = [
+] }
+jemalloc-sys = { package = "tikv-jemalloc-sys", version = "0.6.0", features = [
+    "background_threads_runtime_support",
+    "background_threads",
+], optional = true }
+
 [build-dependencies]
 tonic-build = "0.12"
 globwalk = "0.8.1"
@@ -289,11 +291,10 @@ tokio-socks = "0.5.2"
 
 
 [features]
-default = ["wireguard", "mimalloc", "websocket", "smoltcp", "tun", "socks5", "quic"]
+default = ["wireguard", "websocket", "smoltcp", "tun", "socks5", "quic"]
 full = [
     "websocket",
     "wireguard",
-    "mimalloc",
     "aes-gcm",
     "smoltcp",
     "tun",
@@ -313,4 +314,5 @@ websocket = [
 ]
 smoltcp = ["dep:smoltcp", "dep:parking_lot"]
 socks5 = ["dep:smoltcp"]
-jemalloc = ["dep:jemallocator", "dep:jemalloc-ctl", "dep:jemalloc-sys"]
+jemalloc = ["dep:jemallocator", "dep:jemalloc-sys"]
+jemalloc-prof = ["jemalloc", "dep:jemalloc-ctl", "jemalloc-ctl/stats", "jemalloc-sys/profiling", "jemalloc-sys/stats"]

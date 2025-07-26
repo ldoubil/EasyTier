@@ -526,6 +526,19 @@ impl Instance {
         });
     }
 
+    async fn run_quic_dst(&mut self) -> Result<(), Error> {
+        if !self.global_ctx.get_flags().enable_quic_proxy {
+            return Ok(());
+        }
+
+        let quic_dst = QUICProxyDst::new(self.global_ctx.clone())?;
+        quic_dst.start().await?;
+        self.global_ctx
+            .set_quic_proxy_port(Some(quic_dst.local_addr()?.port()));
+        self.quic_proxy_dst = Some(quic_dst);
+        Ok(())
+    }
+
     pub async fn run(&mut self) -> Result<(), Error> {
         self.listener_manager
             .lock()
@@ -588,11 +601,16 @@ impl Instance {
         }
 
         if !self.global_ctx.get_flags().disable_quic_input {
-            let quic_dst = QUICProxyDst::new(self.global_ctx.clone())?;
-            quic_dst.start().await?;
-            self.global_ctx
-                .set_quic_proxy_port(Some(quic_dst.local_addr()?.port()));
-            self.quic_proxy_dst = Some(quic_dst);
+            if let Err(e) = self.run_quic_dst().await {
+                eprintln!(
+                    "quic input start failed: {:?} (some platforms may not support)",
+                    e
+                );
+            }
+        }
+
+        if let Some(acl) = self.global_ctx.config.get_acl() {
+            self.global_ctx.get_acl_filter().reload_rules(Some(&acl));
         }
 
         // run after tun device created, so listener can bind to tun device, which may be required by win 10
@@ -787,10 +805,11 @@ impl Instance {
         let mapped_listener_manager_rpc = self.get_mapped_listener_manager_rpc_service();
 
         let s = self.rpc_server.as_mut().unwrap();
-        s.registry().register(
-            PeerManageRpcServer::new(PeerManagerRpcService::new(peer_mgr)),
-            "",
-        );
+        let peer_mgr_rpc_service = PeerManagerRpcService::new(peer_mgr.clone());
+        s.registry()
+            .register(PeerManageRpcServer::new(peer_mgr_rpc_service.clone()), "");
+        s.registry()
+            .register(AclManageRpcServer::new(peer_mgr_rpc_service), "");
         s.registry().register(
             ConnectorManageRpcServer::new(ConnectorManagerRpcService(conn_manager)),
             "",

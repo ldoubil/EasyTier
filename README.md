@@ -105,9 +105,9 @@ After successful execution, you can check the network status using `easytier-cli
 ```text
 | ipv4         | hostname       | cost  | lat_ms | loss_rate | rx_bytes | tx_bytes | tunnel_proto | nat_type | id         | version         |
 | ------------ | -------------- | ----- | ------ | --------- | -------- | -------- | ------------ | -------- | ---------- | --------------- |
-| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.0-70e69a38~ |
-| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.0-70e69a38~ |
-|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.0-70e69a38~ |
+| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.2-70e69a38~ |
+| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.2-70e69a38~ |
+|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.2-70e69a38~ |
 ```
 
 You can test connectivity between nodes:
@@ -302,13 +302,17 @@ CDN acceleration and security protection for this project are sponsored by Tence
   </a>
 </p>
 
-Special thanks to [Langlang Cloud](https://langlang.cloud/) for sponsoring our public servers.
+Special thanks to [Langlang Cloud](https://langlangy.cn/?i26c5a5)  and [RainCloud](https://www.rainyun.com/NjM0NzQ1_) for sponsoring our public servers.
 
 <p align="center">
 <a href="https://langlangy.cn/?i26c5a5" target="_blank">
 <img src="assets/langlang.png" width="200">
 </a>
+<a href="https://langlangy.cn/?i26c5a5" target="_blank">
+<img src="assets/raincloud.png" width="200">
+</a>
 </p>
+
 
 If you find EasyTier helpful, please consider sponsoring us. Software development and maintenance require a lot of time and effort, and your sponsorship will help us better maintain and improve EasyTier.
 

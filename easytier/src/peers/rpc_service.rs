@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
-use crate::proto::{
-    cli::{
-        AclManageRpc, DumpRouteRequest, DumpRouteResponse, GetAclStatsRequest, GetAclStatsResponse,
-        ListForeignNetworkRequest, ListForeignNetworkResponse, ListGlobalForeignNetworkRequest,
-        ListGlobalForeignNetworkResponse, ListPeerRequest, ListPeerResponse, ListRouteRequest,
-        ListRouteResponse, PeerInfo, PeerManageRpc, ShowNodeInfoRequest, ShowNodeInfoResponse,
+use crate::{
+    common::acl_processor::AclRuleBuilder,
+    proto::{
+        cli::{
+            AclManageRpc, DumpRouteRequest, DumpRouteResponse, GetAclStatsRequest,
+            GetAclStatsResponse, GetWhitelistRequest, GetWhitelistResponse,
+            ListForeignNetworkRequest, ListForeignNetworkResponse, ListGlobalForeignNetworkRequest,
+            ListGlobalForeignNetworkResponse, ListPeerRequest, ListPeerResponse, ListRouteRequest,
+            ListRouteResponse, PeerInfo, PeerManageRpc, SetWhitelistRequest, SetWhitelistResponse,
+            ShowNodeInfoRequest, ShowNodeInfoResponse,
+        },
+        rpc_types::{self, controller::BaseController},
     },
-    rpc_types::{self, controller::BaseController},
 };
 
 use super::peer_manager::PeerManager;
@@ -35,17 +40,19 @@ impl PeerManagerRpcService {
         let peer_map = peer_manager.get_peer_map();
         let mut peer_infos = Vec::new();
         for peer in peers {
-            let mut peer_info = PeerInfo::default();
-            peer_info.peer_id = peer;
-            peer_info.default_conn_id = peer_map
-                .get_peer_default_conn_id(peer)
-                .await
-                .map(Into::into);
-            peer_info.directly_connected_conns = peer_map
-                .get_directly_connections_by_peer_id(peer)
-                .into_iter()
-                .map(Into::into)
-                .collect();
+            let mut peer_info = PeerInfo {
+                peer_id: peer,
+                default_conn_id: peer_map
+                    .get_peer_default_conn_id(peer)
+                    .await
+                    .map(Into::into),
+                directly_connected_conns: peer_map
+                    .get_directly_connections_by_peer_id(peer)
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                ..Default::default()
+            };
 
             if let Some(conns) = peer_map.list_peer_conns(peer).await {
                 peer_info.conns = conns;
@@ -88,8 +95,9 @@ impl PeerManageRpc for PeerManagerRpcService {
         _: BaseController,
         _request: ListRouteRequest, // Accept request of type HelloRequest
     ) -> Result<ListRouteResponse, rpc_types::error::Error> {
-        let mut reply = ListRouteResponse::default();
-        reply.routes = self.peer_manager.list_routes().await;
+        let reply = ListRouteResponse {
+            routes: self.peer_manager.list_routes().await,
+        };
         Ok(reply)
     }
 
@@ -98,8 +106,9 @@ impl PeerManageRpc for PeerManagerRpcService {
         _: BaseController,
         _request: DumpRouteRequest, // Accept request of type HelloRequest
     ) -> Result<DumpRouteResponse, rpc_types::error::Error> {
-        let mut reply = DumpRouteResponse::default();
-        reply.result = self.peer_manager.dump_route().await;
+        let reply = DumpRouteResponse {
+            result: self.peer_manager.dump_route().await,
+        };
         Ok(reply)
     }
 
@@ -151,6 +160,47 @@ impl AclManageRpc for PeerManagerRpcService {
             .get_stats();
         Ok(GetAclStatsResponse {
             acl_stats: Some(acl_stats),
+        })
+    }
+
+    async fn set_whitelist(
+        &self,
+        _: BaseController,
+        request: SetWhitelistRequest,
+    ) -> Result<SetWhitelistResponse, rpc_types::error::Error> {
+        tracing::info!(
+            "Setting whitelist - TCP: {:?}, UDP: {:?}",
+            request.tcp_ports,
+            request.udp_ports
+        );
+
+        let global_ctx = self.peer_manager.get_global_ctx();
+
+        global_ctx.config.set_tcp_whitelist(request.tcp_ports);
+        global_ctx.config.set_udp_whitelist(request.udp_ports);
+        global_ctx
+            .get_acl_filter()
+            .reload_rules(AclRuleBuilder::build(&global_ctx)?.as_ref());
+
+        Ok(SetWhitelistResponse {})
+    }
+
+    async fn get_whitelist(
+        &self,
+        _: BaseController,
+        _request: GetWhitelistRequest,
+    ) -> Result<GetWhitelistResponse, rpc_types::error::Error> {
+        let global_ctx = self.peer_manager.get_global_ctx();
+        let tcp_ports = global_ctx.config.get_tcp_whitelist();
+        let udp_ports = global_ctx.config.get_udp_whitelist();
+        tracing::info!(
+            "Getting whitelist - TCP: {:?}, UDP: {:?}",
+            tcp_ports,
+            udp_ports
+        );
+        Ok(GetWhitelistResponse {
+            tcp_ports,
+            udp_ports,
         })
     }
 }

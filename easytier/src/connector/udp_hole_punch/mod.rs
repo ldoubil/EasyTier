@@ -39,7 +39,7 @@ pub(crate) mod cone;
 pub(crate) mod sym_to_cone;
 
 // sym punch should be serialized
-static SYM_PUNCH_LOCK: Lazy<DashMap<PeerId, Arc<Mutex<()>>>> = Lazy::new(|| DashMap::new());
+static SYM_PUNCH_LOCK: Lazy<DashMap<PeerId, Arc<Mutex<()>>>> = Lazy::new(DashMap::new);
 pub static RUN_TESTING: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
 // Blacklist timeout in seconds
@@ -183,7 +183,7 @@ impl BackOff {
 pub fn handle_rpc_result<T>(
     ret: Result<T, rpc_types::error::Error>,
     dst_peer_id: PeerId,
-    blacklist: Arc<timedmap::TimedMap<PeerId, ()>>,
+    blacklist: &timedmap::TimedMap<PeerId, ()>,
 ) -> Result<T, rpc_types::error::Error> {
     match ret {
         Ok(ret) => Ok(ret),
@@ -223,7 +223,7 @@ impl UdpHoePunchConnectorData {
 
     #[tracing::instrument(skip(self))]
     async fn handle_punch_result(
-        self: &Self,
+        &self,
         ret: Result<Option<Box<dyn Tunnel>>, Error>,
         backoff: Option<&mut BackOff>,
         round: Option<&mut u32>,
@@ -236,10 +236,8 @@ impl UdpHoePunchConnectorData {
                 if let Some(round) = round {
                     *round = round.saturating_sub(1);
                 }
-            } else {
-                if let Some(round) = round {
-                    *round += 1;
-                }
+            } else if let Some(round) = round {
+                *round += 1;
             }
         };
 
@@ -464,7 +462,7 @@ impl PeerTaskLauncher for UdpHolePunchPeerTaskLauncher {
             }
 
             let conns = data.peer_mgr.list_peer_conns(peer_id).await;
-            if conns.is_some() && conns.unwrap().len() > 0 {
+            if conns.is_some() && !conns.unwrap().is_empty() {
                 continue;
             }
 

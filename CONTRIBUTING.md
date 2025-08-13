@@ -26,7 +26,7 @@ Thank you for your interest in contributing to EasyTier! This document provides 
 #### Required Tools
 - Node.js v21 or higher
 - pnpm v9 or higher
-- Rust toolchain (version 1.87)
+- Rust toolchain (version 1.89)
 - LLVM and Clang
 - Protoc (Protocol Buffers compiler)
 
@@ -37,7 +37,6 @@ Thank you for your interest in contributing to EasyTier! This document provides 
 # Core build dependencies
 sudo apt-get update && sudo apt-get install -y \
     musl-tools \
-    libappindicator3-dev \
     llvm \
     clang \
     protobuf-compiler
@@ -53,6 +52,7 @@ sudo apt install -y \
     librsvg2-dev \
     libxdo-dev \
     libssl-dev \
+    libappindicator3-dev \
     patchelf
 
 # Testing dependencies
@@ -79,8 +79,8 @@ sudo apt install -y bridge-utils
 2. Install dependencies:
    ```bash
    # Install Rust toolchain
-   rustup install 1.87
-   rustup default 1.87
+   rustup install 1.89
+   rustup default 1.89
 
    # Install project dependencies
    pnpm -r install

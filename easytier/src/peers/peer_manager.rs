@@ -24,6 +24,7 @@ use crate::{
         constants::EASYTIER_VERSION,
         error::Error,
         global_ctx::{ArcGlobalCtx, NetworkIdentity},
+        stats_manager::{CounterHandle, LabelSet, LabelType, MetricName},
         stun::StunInfoCollectorTrait,
         PeerId,
     },
@@ -70,7 +71,7 @@ struct RpcTransport {
     packet_recv: Mutex<UnboundedReceiver<ZCPacket>>,
     peer_rpc_tspt_sender: UnboundedSender<ZCPacket>,
 
-    encryptor: Arc<Box<dyn Encryptor>>,
+    encryptor: Arc<dyn Encryptor>,
 }
 
 #[async_trait::async_trait]
@@ -116,6 +117,13 @@ enum RouteAlgoInst {
     None,
 }
 
+struct SelfTxCounters {
+    self_tx_packets: CounterHandle,
+    self_tx_bytes: CounterHandle,
+    compress_tx_bytes_before: CounterHandle,
+    compress_tx_bytes_after: CounterHandle,
+}
+
 pub struct PeerManager {
     my_peer_id: PeerId,
 
@@ -139,14 +147,16 @@ pub struct PeerManager {
     foreign_network_manager: Arc<ForeignNetworkManager>,
     foreign_network_client: Arc<ForeignNetworkClient>,
 
-    encryptor: Arc<Box<dyn Encryptor>>,
+    encryptor: Arc<dyn Encryptor + 'static>,
     data_compress_algo: CompressorAlgo,
 
-    exit_nodes: Vec<Ipv4Addr>,
+    exit_nodes: Vec<IpAddr>,
 
     reserved_my_peer_id_map: DashMap<String, PeerId>,
 
     allow_loopback_tunnel: AtomicBool,
+
+    self_tx_counters: SelfTxCounters,
 }
 
 impl Debug for PeerManager {
@@ -174,25 +184,18 @@ impl PeerManager {
             my_peer_id,
         ));
 
-        let mut encryptor: Arc<Box<dyn Encryptor>> = Arc::new(Box::new(NullCipher));
-        if global_ctx.get_flags().enable_encryption {
-            #[cfg(feature = "wireguard")]
-            {
-                use super::encrypt::ring_aes_gcm::AesGcmCipher;
-                encryptor = Arc::new(Box::new(AesGcmCipher::new_128(global_ctx.get_128_key())));
-            }
-
-            #[cfg(all(feature = "aes-gcm", not(feature = "wireguard")))]
-            {
-                use super::encrypt::aes_gcm::AesGcmCipher;
-                encryptor = Arc::new(Box::new(AesGcmCipher::new_128(global_ctx.get_128_key())));
-            }
-
-            #[cfg(all(not(feature = "wireguard"), not(feature = "aes-gcm")))]
-            {
-                compile_error!("wireguard or aes-gcm feature must be enabled for encryption");
-            }
-        }
+        let encryptor = if global_ctx.get_flags().enable_encryption {
+            // 只有在启用加密时才使用工厂函数选择算法
+            let algorithm = &global_ctx.get_flags().encryption_algorithm;
+            super::encrypt::create_encryptor(
+                algorithm,
+                global_ctx.get_128_key(),
+                global_ctx.get_256_key(),
+            )
+        } else {
+            // disable_encryption = true 时使用 NullCipher
+            Arc::new(NullCipher)
+        };
 
         if global_ctx
             .check_network_in_whitelist(&global_ctx.get_network_name())
@@ -214,7 +217,10 @@ impl PeerManager {
             peer_rpc_tspt_sender,
             encryptor: encryptor.clone(),
         });
-        let peer_rpc_mgr = Arc::new(PeerRpcManager::new(rpc_tspt.clone()));
+        let peer_rpc_mgr = Arc::new(PeerRpcManager::new_with_stats_manager(
+            rpc_tspt.clone(),
+            global_ctx.stats_manager().clone(),
+        ));
 
         let route_algo_inst = match route_algo {
             RouteAlgoType::Ospf => RouteAlgoInst::Ospf(PeerRoute::new(
@@ -245,6 +251,30 @@ impl PeerManager {
             .expect("invalid data compress algo, maybe some features not enabled");
 
         let exit_nodes = global_ctx.config.get_exit_nodes();
+
+        let stats_manager = global_ctx.stats_manager();
+        let self_tx_counters = SelfTxCounters {
+            self_tx_packets: stats_manager.get_counter(
+                MetricName::TrafficPacketsSelfTx,
+                LabelSet::new()
+                    .with_label_type(LabelType::NetworkName(global_ctx.get_network_name())),
+            ),
+            self_tx_bytes: stats_manager.get_counter(
+                MetricName::TrafficBytesSelfTx,
+                LabelSet::new()
+                    .with_label_type(LabelType::NetworkName(global_ctx.get_network_name())),
+            ),
+            compress_tx_bytes_before: stats_manager.get_counter(
+                MetricName::CompressionBytesTxBefore,
+                LabelSet::new()
+                    .with_label_type(LabelType::NetworkName(global_ctx.get_network_name())),
+            ),
+            compress_tx_bytes_after: stats_manager.get_counter(
+                MetricName::CompressionBytesTxAfter,
+                LabelSet::new()
+                    .with_label_type(LabelType::NetworkName(global_ctx.get_network_name())),
+            ),
+        };
 
         PeerManager {
             my_peer_id,
@@ -277,6 +307,8 @@ impl PeerManager {
             reserved_my_peer_id_map: DashMap::new(),
 
             allow_loopback_tunnel: AtomicBool::new(true),
+
+            self_tx_counters,
         }
     }
 
@@ -319,7 +351,8 @@ impl PeerManager {
                 "network identity not match".to_string(),
             ));
         }
-        Ok(self.peers.add_new_peer_conn(peer_conn).await)
+        self.peers.add_new_peer_conn(peer_conn).await;
+        Ok(())
     }
 
     pub async fn add_client_tunnel(
@@ -345,10 +378,8 @@ impl PeerManager {
     pub fn has_directly_connected_conn(&self, peer_id: PeerId) -> bool {
         if let Some(peer) = self.peers.get_peer_by_id(peer_id) {
             peer.has_directly_connected_conn()
-        } else if self.foreign_network_client.get_peer_map().has_peer(peer_id) {
-            true
         } else {
-            false
+            self.foreign_network_client.get_peer_map().has_peer(peer_id)
         }
     }
 
@@ -409,14 +440,14 @@ impl PeerManager {
             match addr {
                 SocketAddr::V4(addr) => {
                     if let Some(virtual_ipv4) = virtual_ipv4 {
-                        if virtual_ipv4.contains(&addr.ip()) {
+                        if virtual_ipv4.contains(addr.ip()) {
                             anyhow::bail!("tunnel src host is from the virtual network (ignore this error please)");
                         }
                     }
                 }
                 SocketAddr::V6(addr) => {
                     if let Some(virtual_ipv6) = virtual_ipv6 {
-                        if virtual_ipv6.contains(&addr.ip()) {
+                        if virtual_ipv6.contains(addr.ip()) {
                             anyhow::bail!("tunnel src host is from the virtual network (ignore this error please)");
                         }
                     }
@@ -457,7 +488,7 @@ impl PeerManager {
                     rand::random::<PeerId>()
                 }).value());
             }
-            peer.set_peer_id(peer_id.clone().unwrap());
+            peer.set_peer_id(peer_id.unwrap());
 
             tracing::info!(
                 ?peer_id,
@@ -507,9 +538,24 @@ impl PeerManager {
         let foreign_network_my_peer_id =
             foreign_network_mgr.get_network_peer_id(&foreign_network_name);
 
+        let buf_len = packet.buf_len();
+        let stats_manager = peer_map.get_global_ctx().stats_manager().clone();
+        let label_set =
+            LabelSet::new().with_label_type(LabelType::NetworkName(foreign_network_name.clone()));
+        let add_counter = move |bytes_metric, packets_metric| {
+            stats_manager
+                .get_counter(bytes_metric, label_set.clone())
+                .add(buf_len as u64);
+            stats_manager.get_counter(packets_metric, label_set).inc();
+        };
+
         // NOTICE: the to peer id is modified by the src from foreign network my peer id to the origin my peer id
         if to_peer_id == my_peer_id {
             // packet sent from other peer to me, extract the inner packet and forward it
+            add_counter(
+                MetricName::TrafficBytesForeignForwardRx,
+                MetricName::TrafficPacketsForeignForwardRx,
+            );
             if let Err(e) = foreign_network_mgr
                 .send_msg_to_peer(
                     &foreign_network_name,
@@ -540,6 +586,11 @@ impl PeerManager {
                 return Err(packet);
             };
 
+            add_counter(
+                MetricName::TrafficBytesForeignForwardTx,
+                MetricName::TrafficPacketsForeignForwardTx,
+            );
+
             // modify the to_peer id from foreign network my peer id to the origin my peer id
             packet
                 .mut_peer_manager_header()
@@ -558,10 +609,13 @@ impl PeerManager {
                     "send_msg_directly failed when forward local generated foreign network packet"
                 );
             }
-
             Ok(())
         } else {
             // target is not me, forward it. try get origin peer id
+            add_counter(
+                MetricName::TrafficBytesForeignForwardForwarded,
+                MetricName::TrafficPacketsForeignForwardForwarded,
+            );
             Err(packet)
         }
     }
@@ -577,6 +631,29 @@ impl PeerManager {
         let compress_algo = self.data_compress_algo;
         let acl_filter = self.global_ctx.get_acl_filter().clone();
         let global_ctx = self.global_ctx.clone();
+        let stats_mgr = self.global_ctx.stats_manager().clone();
+
+        let label_set =
+            LabelSet::new().with_label_type(LabelType::NetworkName(global_ctx.get_network_name()));
+
+        let self_tx_bytes = self.self_tx_counters.self_tx_bytes.clone();
+        let self_tx_packets = self.self_tx_counters.self_tx_packets.clone();
+        let self_rx_bytes =
+            stats_mgr.get_counter(MetricName::TrafficBytesSelfRx, label_set.clone());
+        let self_rx_packets =
+            stats_mgr.get_counter(MetricName::TrafficPacketsSelfRx, label_set.clone());
+        let forward_tx_bytes =
+            stats_mgr.get_counter(MetricName::TrafficBytesForwarded, label_set.clone());
+        let forward_tx_packets =
+            stats_mgr.get_counter(MetricName::TrafficPacketsForwarded, label_set.clone());
+
+        let compress_tx_bytes_before = self.self_tx_counters.compress_tx_bytes_before.clone();
+        let compress_tx_bytes_after = self.self_tx_counters.compress_tx_bytes_after.clone();
+        let compress_rx_bytes_before =
+            stats_mgr.get_counter(MetricName::CompressionBytesRxBefore, label_set.clone());
+        let compress_rx_bytes_after =
+            stats_mgr.get_counter(MetricName::CompressionBytesRxAfter, label_set.clone());
+
         self.tasks.lock().await.spawn(async move {
             tracing::trace!("start_peer_recv");
             while let Ok(ret) = recv_packet_from_chan(&mut recv).await {
@@ -587,6 +664,7 @@ impl PeerManager {
                     continue;
                 };
 
+                let buf_len = ret.buf_len();
                 let Some(hdr) = ret.mut_peer_manager_header() else {
                     tracing::warn!(?ret, "invalid packet, skip");
                     continue;
@@ -608,13 +686,24 @@ impl PeerManager {
 
                     hdr.forward_counter += 1;
 
-                    if from_peer_id == my_peer_id
-                        && (hdr.packet_type == PacketType::Data as u8
+                    if from_peer_id == my_peer_id {
+                        compress_tx_bytes_before.add(buf_len as u64);
+
+                        if hdr.packet_type == PacketType::Data as u8
                             || hdr.packet_type == PacketType::KcpSrc as u8
-                            || hdr.packet_type == PacketType::KcpDst as u8)
-                    {
-                        let _ = Self::try_compress_and_encrypt(compress_algo, &encryptor, &mut ret)
-                            .await;
+                            || hdr.packet_type == PacketType::KcpDst as u8
+                        {
+                            let _ =
+                                Self::try_compress_and_encrypt(compress_algo, &encryptor, &mut ret)
+                                    .await;
+                        }
+
+                        compress_tx_bytes_after.add(ret.buf_len() as u64);
+                        self_tx_bytes.add(ret.buf_len() as u64);
+                        self_tx_packets.inc();
+                    } else {
+                        forward_tx_bytes.add(buf_len as u64);
+                        forward_tx_packets.inc();
                     }
 
                     tracing::trace!(?to_peer_id, ?my_peer_id, "need forward");
@@ -629,11 +718,17 @@ impl PeerManager {
                         continue;
                     }
 
+                    self_rx_bytes.add(buf_len as u64);
+                    self_rx_packets.inc();
+                    compress_rx_bytes_before.add(buf_len as u64);
+
                     let compressor = DefaultCompressor {};
                     if let Err(e) = compressor.decompress(&mut ret).await {
                         tracing::error!(?e, "decompress failed");
                         continue;
                     }
+
+                    compress_rx_bytes_after.add(ret.buf_len() as u64);
 
                     if !acl_filter.process_packet_with_acl(
                         &ret,
@@ -646,10 +741,8 @@ impl PeerManager {
 
                     let mut processed = false;
                     let mut zc_packet = Some(ret);
-                    let mut idx = 0;
-                    for pipeline in pipe_line.read().await.iter().rev() {
+                    for (idx, pipeline) in pipe_line.read().await.iter().rev().enumerate() {
                         tracing::trace!(?zc_packet, ?idx, "try_process_packet_from_peer");
-                        idx += 1;
                         zc_packet = pipeline
                             .try_process_packet_from_peer(zc_packet.unwrap())
                             .await;
@@ -842,14 +935,17 @@ impl PeerManager {
             let entry = resp
                 .foreign_networks
                 .entry(info.key.as_ref().unwrap().peer_id)
-                .or_insert_with(|| Default::default());
+                .or_insert_with(Default::default);
+            let Some(route_info) = info.value.as_ref() else {
+                continue;
+            };
 
-            let mut f = OneForeignNetwork::default();
-            f.network_name = info.key.as_ref().unwrap().network_name.clone();
-            f.peer_ids
-                .extend(info.value.as_ref().unwrap().foreign_peer_ids.iter());
-            f.last_updated = format!("{}", info.value.as_ref().unwrap().last_update.unwrap());
-            f.version = info.value.as_ref().unwrap().version;
+            let f = OneForeignNetwork {
+                network_name: info.key.as_ref().unwrap().network_name.clone(),
+                peer_ids: route_info.foreign_peer_ids.clone(),
+                last_updated: format!("{}", route_info.last_update.unwrap()),
+                version: route_info.version,
+            };
 
             entry.foreign_networks.push(f);
         }
@@ -937,17 +1033,14 @@ impl PeerManager {
             || ipv4_addr.is_multicast()
             || *ipv4_addr == ipv4_inet.last_address()
         {
-            dst_peers.extend(
-                self.peers
-                    .list_routes()
-                    .await
-                    .iter()
-                    .map(|x| x.key().clone()),
-            );
-        } else if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(&ipv4_addr).await {
+            dst_peers.extend(self.peers.list_routes().await.iter().map(|x| *x.key()));
+        } else if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(ipv4_addr).await {
             dst_peers.push(peer_id);
         } else {
             for exit_node in &self.exit_nodes {
+                let IpAddr::V4(exit_node) = exit_node else {
+                    continue;
+                };
                 if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(exit_node).await {
                     dst_peers.push(peer_id);
                     is_exit_node = true;
@@ -976,27 +1069,20 @@ impl PeerManager {
             .unwrap_or(64);
         let ipv6_inet = cidr::Ipv6Inet::new(*ipv6_addr, network_length).unwrap();
         if ipv6_addr.is_multicast() || *ipv6_addr == ipv6_inet.last_address() {
-            dst_peers.extend(
-                self.peers
-                    .list_routes()
-                    .await
-                    .iter()
-                    .map(|x| x.key().clone()),
-            );
-        } else if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(&ipv6_addr).await {
+            dst_peers.extend(self.peers.list_routes().await.iter().map(|x| *x.key()));
+        } else if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(ipv6_addr).await {
             dst_peers.push(peer_id);
-        } else {
-            // For IPv6, we'll need to implement exit node support later
-            // For now, just try to find any available peer for routing
-            if dst_peers.is_empty() {
-                dst_peers.extend(
-                    self.peers
-                        .list_routes()
-                        .await
-                        .iter()
-                        .map(|x| x.key().clone()),
-                );
-                is_exit_node = true;
+        } else if !ipv6_addr.is_unicast_link_local() {
+            // NOTE: never route link local address to exit node.
+            for exit_node in &self.exit_nodes {
+                let IpAddr::V6(exit_node) = exit_node else {
+                    continue;
+                };
+                if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(exit_node).await {
+                    dst_peers.push(peer_id);
+                    is_exit_node = true;
+                    break;
+                }
             }
         }
 
@@ -1005,7 +1091,7 @@ impl PeerManager {
 
     pub async fn try_compress_and_encrypt(
         compress_algo: CompressorAlgo,
-        encryptor: &Box<dyn Encryptor>,
+        encryptor: &Arc<dyn Encryptor + 'static>,
         msg: &mut ZCPacket,
     ) -> Result<(), Error> {
         let compressor = DefaultCompressor {};
@@ -1051,7 +1137,15 @@ impl PeerManager {
             return Ok(());
         }
 
+        self.self_tx_counters
+            .compress_tx_bytes_before
+            .add(msg.buf_len() as u64);
+
         Self::try_compress_and_encrypt(self.data_compress_algo, &self.encryptor, &mut msg).await?;
+
+        self.self_tx_counters
+            .compress_tx_bytes_after
+            .add(msg.buf_len() as u64);
 
         let is_latency_first = self.global_ctx.get_flags().latency_first;
         msg.mut_peer_manager_header()
@@ -1062,18 +1156,22 @@ impl PeerManager {
         let mut errs: Vec<Error> = vec![];
         let mut msg = Some(msg);
         let total_dst_peers = dst_peers.len();
-        for i in 0..total_dst_peers {
+        for (i, peer_id) in dst_peers.iter().enumerate() {
             let mut msg = if i == total_dst_peers - 1 {
                 msg.take().unwrap()
             } else {
                 msg.clone().unwrap()
             };
 
-            let peer_id = &dst_peers[i];
             msg.mut_peer_manager_header()
                 .unwrap()
                 .to_peer_id
                 .set(*peer_id);
+
+            self.self_tx_counters
+                .self_tx_bytes
+                .add(msg.buf_len() as u64);
+            self.self_tx_counters.self_tx_packets.inc();
 
             if let Err(e) =
                 Self::send_msg_internal(&self.peers, &self.foreign_network_client, msg, *peer_id)
@@ -1241,6 +1339,45 @@ impl PeerManager {
             .await;
         tracing::info!("close_peer_conn in foreign network manager done: {:?}", ret);
         ret
+    }
+
+    pub async fn check_allow_kcp_to_dst(&self, dst_ip: &IpAddr) -> bool {
+        let route = self.get_route();
+        let Some(dst_peer_id) = route.get_peer_id_by_ip(dst_ip).await else {
+            return false;
+        };
+        let Some(peer_info) = route.get_peer_info(dst_peer_id).await else {
+            return false;
+        };
+
+        // check dst allow kcp input
+        if !peer_info.feature_flag.map(|x| x.kcp_input).unwrap_or(false) {
+            return false;
+        }
+
+        let next_hop_policy = Self::get_next_hop_policy(self.global_ctx.get_flags().latency_first);
+        // check relay node allow relay kcp.
+        let Some(next_hop_id) = route
+            .get_next_hop_with_policy(dst_peer_id, next_hop_policy)
+            .await
+        else {
+            return false;
+        };
+
+        let Some(next_hop_info) = route.get_peer_info(next_hop_id).await else {
+            return false;
+        };
+
+        // check next hop allow kcp relay
+        if next_hop_info
+            .feature_flag
+            .map(|x| x.no_relay_kcp)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        true
     }
 }
 
@@ -1482,16 +1619,16 @@ mod tests {
                 ..Default::default()
             });
         tokio::time::sleep(Duration::from_secs(2)).await;
-        wait_route_appear_with_cost(peer_mgr_a.clone(), peer_mgr_c.my_peer_id, Some(3))
+        if wait_route_appear_with_cost(peer_mgr_a.clone(), peer_mgr_c.my_peer_id, Some(3))
             .await
-            .expect(
-                format!(
-                    "route not appear, a route table: {}, table: {:#?}",
-                    peer_mgr_a.get_route().dump().await,
-                    peer_mgr_a.get_route().list_routes().await
-                )
-                .as_str(),
-            );
+            .is_err()
+        {
+            panic!(
+                "route not appear, a route table: {}, table: {:#?}",
+                peer_mgr_a.get_route().dump().await,
+                peer_mgr_a.get_route().list_routes().await
+            )
+        }
 
         let ret = peer_mgr_a
             .get_route()
@@ -1617,8 +1754,7 @@ mod tests {
                     .get_foreign_network_client()
                     .list_public_peers()
                     .await
-                    .len()
-                    == 0
+                    .is_empty()
             },
             Duration::from_secs(10),
         )
@@ -1660,8 +1796,7 @@ mod tests {
                     .get_foreign_network_client()
                     .list_public_peers()
                     .await
-                    .len()
-                    == 0
+                    .is_empty()
             },
             Duration::from_secs(10),
         )

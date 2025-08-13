@@ -1876,7 +1876,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1979,7 +1979,7 @@ checksum = "0d6ef0072f8a535281e4876be788938b528e9a1d43900b82c2569af7da799125"
 
 [[package]]
 name = "easytier"
-version = "2.4.0"
+version = "2.4.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2033,6 +2033,7 @@ dependencies = [
  "network-interface",
  "nix 0.29.0",
  "once_cell",
+ "openssl",
  "parking_lot",
  "percent-encoding",
  "petgraph 0.8.1",
@@ -2112,16 +2113,17 @@ dependencies = [
 
 [[package]]
 name = "easytier-gui"
-version = "2.4.0"
+version = "2.4.2"
 dependencies = [
  "anyhow",
  "chrono",
  "dashmap",
  "dunce",
  "easytier",
- "elevated-command",
  "gethostname 1.0.2",
+ "libc",
  "once_cell",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tauri",
@@ -2137,6 +2139,8 @@ dependencies = [
  "thunk-rs",
  "tokio",
  "uuid",
+ "winapi",
+ "windows 0.52.0",
 ]
 
 [[package]]
@@ -2159,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "easytier-web"
-version = "2.4.0"
+version = "2.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2205,20 +2209,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60b1af1c220855b6ceac025d3f6ecdd2b7c4894bfe9cd9bda4fbb4bc7c0d4cf0"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "elevated-command"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54c410eccdcc5b759704fdb6a792afe6b01ab8a062e2c003ff2567e2697a94aa"
-dependencies = [
- "anyhow",
- "base64 0.21.7",
- "libc",
- "log",
- "winapi",
- "windows 0.52.0",
 ]
 
 [[package]]
@@ -5246,6 +5236,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff011a302c396a5197692431fc1948019154afc178baf7d8e37367442a4601cf"
 
 [[package]]
+name = "openssl-src"
+version = "300.5.2+3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d270b79e2926f5150189d475bc7e9d2c69f9c4697b185fa917d5a32b792d21b4"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "openssl-sys"
 version = "0.9.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5253,6 +5252,7 @@ checksum = "7f9e8deee91df40a943c71b917e5874b951d32a802526c85721ce3b776c929d6"
 dependencies = [
  "cc",
  "libc",
+ "openssl-src",
  "pkg-config",
  "vcpkg",
 ]
@@ -7557,9 +7557,9 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.5.7"
+version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce305eb0b4296696835b71df73eb912e0f1ffd2556a501fcede6e0c50349191c"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",

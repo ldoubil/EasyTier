@@ -1,4 +1,7 @@
-use std::{net::{Ipv4Addr, Ipv6Addr}, sync::Arc};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+};
 
 use dashmap::DashMap;
 
@@ -10,16 +13,11 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum NextHopPolicy {
+    #[default]
     LeastHop,
     LeastCost,
-}
-
-impl Default for NextHopPolicy {
-    fn default() -> Self {
-        NextHopPolicy::LeastHop
-    }
 }
 
 pub type ForeignNetworkRouteInfoMap =
@@ -84,6 +82,13 @@ pub trait Route {
 
     async fn get_peer_id_by_ipv6(&self, _ipv6: &Ipv6Addr) -> Option<PeerId> {
         None
+    }
+
+    async fn get_peer_id_by_ip(&self, ip: &std::net::IpAddr) -> Option<PeerId> {
+        match ip {
+            std::net::IpAddr::V4(v4) => self.get_peer_id_by_ipv4(v4).await,
+            std::net::IpAddr::V6(v6) => self.get_peer_id_by_ipv6(v6).await,
+        }
     }
 
     async fn list_peers_own_foreign_network(

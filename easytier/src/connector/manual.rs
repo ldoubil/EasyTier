@@ -4,11 +4,11 @@ use std::{
 };
 
 use anyhow::Context;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
 use tokio::{
     sync::{
         broadcast::{error::RecvError, Receiver},
-        mpsc, Mutex,
+        mpsc,
     },
     task::JoinSet,
     time::timeout,
@@ -32,7 +32,6 @@ use crate::{
         global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
         netns::NetNS,
     },
-    connector::set_bind_addr_for_peer_connector,
     peers::peer_manager::PeerManager,
     proto::cli::{
         Connector, ConnectorManageRpc, ConnectorStatus, ListConnectorRequest,
@@ -43,8 +42,7 @@ use crate::{
 
 use super::create_connector_by_url;
 
-type MutexConnector = Arc<Mutex<Box<dyn TunnelConnector>>>;
-type ConnectorMap = Arc<DashMap<String, MutexConnector>>;
+type ConnectorMap = Arc<DashSet<String>>;
 
 #[derive(Debug, Clone)]
 struct ReconnResult {
@@ -72,7 +70,7 @@ pub struct ManualConnectorManager {
 
 impl ManualConnectorManager {
     pub fn new(global_ctx: ArcGlobalCtx, peer_manager: Arc<PeerManager>) -> Self {
-        let connectors = Arc::new(DashMap::new());
+        let connectors = Arc::new(DashSet::new());
         let tasks = JoinSet::new();
         let event_subscriber = global_ctx.subscribe();
 
@@ -105,14 +103,11 @@ impl ManualConnectorManager {
         T: TunnelConnector + 'static,
     {
         tracing::info!("add_connector: {}", connector.remote_url());
-        self.data.connectors.insert(
-            connector.remote_url().into(),
-            Arc::new(Mutex::new(Box::new(connector))),
-        );
+        self.data.connectors.insert(connector.remote_url().into());
     }
 
     pub async fn add_connector_by_url(&self, url: &str) -> Result<(), Error> {
-        self.add_connector(create_connector_by_url(url, &self.global_ctx, IpVersion::Both).await?);
+        self.data.connectors.insert(url.to_owned());
         Ok(())
     }
 
@@ -136,7 +131,7 @@ impl ManualConnectorManager {
             .data
             .connectors
             .iter()
-            .map(|x| x.key().clone().into())
+            .map(|x| x.key().clone())
             .collect();
 
         let dead_urls: BTreeSet<String> = Self::collect_dead_conns(self.data.clone())
@@ -160,12 +155,8 @@ impl ManualConnectorManager {
             );
         }
 
-        let reconnecting_urls: BTreeSet<String> = self
-            .data
-            .reconnecting
-            .iter()
-            .map(|x| x.clone().into())
-            .collect();
+        let reconnecting_urls: BTreeSet<String> =
+            self.data.reconnecting.iter().map(|x| x.clone()).collect();
 
         for conn_url in reconnecting_urls {
             ret.insert(
@@ -236,16 +227,16 @@ impl ManualConnectorManager {
                     for dead_url in dead_urls {
                         let data_clone = data.clone();
                         let sender = reconn_result_send.clone();
-                        let (_, connector) = data.connectors.remove(&dead_url).unwrap();
+                        data.connectors.remove(&dead_url).unwrap();
                         let insert_succ = data.reconnecting.insert(dead_url.clone());
                         assert!(insert_succ);
 
                         tasks.lock().unwrap().spawn(async move {
-                            let reconn_ret = Self::conn_reconnect(data_clone.clone(), dead_url.clone(), connector.clone()).await;
+                            let reconn_ret = Self::conn_reconnect(data_clone.clone(), dead_url.clone() ).await;
                             let _ = sender.send(reconn_ret).await;
 
                             data_clone.reconnecting.remove(&dead_url).unwrap();
-                            data_clone.connectors.insert(dead_url.clone(), connector);
+                            data_clone.connectors.insert(dead_url.clone());
                         });
                     }
                     tracing::info!("reconn_interval tick, done");
@@ -287,7 +278,7 @@ impl ManualConnectorManager {
         let remove_later = DashSet::new();
         for it in data.removed_conn_urls.iter() {
             let url = it.key();
-            if let Some(_) = data.connectors.remove(url) {
+            if data.connectors.remove(url).is_some() {
                 tracing::warn!("connector: {}, removed", url);
                 continue;
             } else if data.reconnecting.contains(url) {
@@ -306,11 +297,7 @@ impl ManualConnectorManager {
 
     async fn collect_dead_conns(data: Arc<ConnectorManagerData>) -> BTreeSet<String> {
         Self::handle_remove_connector(data.clone());
-        let all_urls: BTreeSet<String> = data
-            .connectors
-            .iter()
-            .map(|x| x.key().clone().into())
-            .collect();
+        let all_urls: BTreeSet<String> = data.connectors.iter().map(|x| x.key().clone()).collect();
         let mut ret = BTreeSet::new();
         for url in all_urls.iter() {
             if !data.alive_conn_urls.contains(url) {
@@ -323,25 +310,13 @@ impl ManualConnectorManager {
     async fn conn_reconnect_with_ip_version(
         data: Arc<ConnectorManagerData>,
         dead_url: String,
-        connector: MutexConnector,
         ip_version: IpVersion,
     ) -> Result<ReconnResult, Error> {
-        let ip_collector = data.global_ctx.get_ip_collector();
+        let connector =
+            create_connector_by_url(&dead_url, &data.global_ctx.clone(), ip_version).await?;
 
-        connector.lock().await.set_ip_version(ip_version);
-
-        if data.global_ctx.config.get_flags().bind_device {
-            set_bind_addr_for_peer_connector(
-                connector.lock().await.as_mut(),
-                ip_version == IpVersion::V4,
-                &ip_collector,
-            )
-            .await;
-        }
-
-        data.global_ctx.issue_event(GlobalCtxEvent::Connecting(
-            connector.lock().await.remote_url().clone(),
-        ));
+        data.global_ctx
+            .issue_event(GlobalCtxEvent::Connecting(connector.remote_url().clone()));
         tracing::info!("reconnect try connect... conn: {:?}", connector);
         let Some(pm) = data.peer_manager.upgrade() else {
             return Err(Error::AnyhowError(anyhow::anyhow!(
@@ -349,9 +324,7 @@ impl ManualConnectorManager {
             )));
         };
 
-        let (peer_id, conn_id) = pm
-            .try_direct_connect(connector.lock().await.as_mut())
-            .await?;
+        let (peer_id, conn_id) = pm.try_direct_connect(connector).await?;
         tracing::info!("reconnect succ: {} {} {}", peer_id, conn_id, dead_url);
         Ok(ReconnResult {
             dead_url,
@@ -363,7 +336,6 @@ impl ManualConnectorManager {
     async fn conn_reconnect(
         data: Arc<ConnectorManagerData>,
         dead_url: String,
-        connector: MutexConnector,
     ) -> Result<ReconnResult, Error> {
         tracing::info!("reconnect: {}", dead_url);
 
@@ -415,31 +387,33 @@ impl ManualConnectorManager {
             let ret = timeout(
                 // allow http connector to wait longer
                 std::time::Duration::from_secs(if use_long_timeout { 20 } else { 2 }),
-                Self::conn_reconnect_with_ip_version(
-                    data.clone(),
-                    dead_url.clone(),
-                    connector.clone(),
-                    ip_version,
-                ),
+                Self::conn_reconnect_with_ip_version(data.clone(), dead_url.clone(), ip_version),
             )
             .await;
             tracing::info!("reconnect: {} done, ret: {:?}", dead_url, ret);
 
-            if ret.is_ok() && ret.as_ref().unwrap().is_ok() {
-                reconn_ret = ret.unwrap();
-                break;
-            } else {
-                if ret.is_err() {
-                    reconn_ret = Err(ret.unwrap_err().into());
-                } else if ret.as_ref().unwrap().is_err() {
-                    reconn_ret = Err(ret.unwrap().unwrap_err());
+            match ret {
+                Ok(Ok(_)) => {
+                    // 外层和内层都成功：解包并跳出
+                    reconn_ret = ret.unwrap();
+                    break;
                 }
-                data.global_ctx.issue_event(GlobalCtxEvent::ConnectError(
-                    dead_url.clone(),
-                    format!("{:?}", ip_version),
-                    format!("{:?}", reconn_ret),
-                ));
+                Ok(Err(e)) => {
+                    // 外层成功，内层失败
+                    reconn_ret = Err(e);
+                }
+                Err(e) => {
+                    // 外层失败
+                    reconn_ret = Err(e.into());
+                }
             }
+
+            // 发送事件（只有在未 break 时才执行）
+            data.global_ctx.issue_event(GlobalCtxEvent::ConnectError(
+                dead_url.clone(),
+                format!("{:?}", ip_version),
+                format!("{:?}", reconn_ret),
+            ));
         }
 
         reconn_ret

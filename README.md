@@ -59,7 +59,7 @@ cargo install --git https://github.com/EasyTier/EasyTier.git easytier
 # See https://easytier.cn/en/guide/installation.html#installation-methods
 
 # 4. Linux Quick Install
-wget -O- https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh | sudo bash
+wget -O- https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh | sudo bash -s install
 
 # 5. MacOS via Homebrew
 brew tap brewforge/chinese
@@ -105,9 +105,9 @@ After successful execution, you can check the network status using `easytier-cli
 ```text
 | ipv4         | hostname       | cost  | lat_ms | loss_rate | rx_bytes | tx_bytes | tunnel_proto | nat_type | id         | version         |
 | ------------ | -------------- | ----- | ------ | --------- | -------- | -------- | ------------ | -------- | ---------- | --------------- |
-| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.2-70e69a38~ |
-| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.2-70e69a38~ |
-|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.2-70e69a38~ |
+| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.5-70e69a38~ |
+| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.5-70e69a38~ |
+|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.5-70e69a38~ |
 ```
 
 You can test connectivity between nodes:
@@ -286,7 +286,10 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 ### Contact Us
 
 - 💬 **[Telegram Group](https://t.me/easytier)**
-- 👥 **[QQ Group: 949700262](https://qm.qq.com/cgi-bin/qm/qr?k=kC8YJ6Jb8vWJIDbZrZJB8pB5YZgPJA5-)**
+- 👥 **[QQ Group]**
+  - No.1 [949700262](https://qm.qq.com/q/wFoTUChqZW)
+  - No.2 [837676408](https://qm.qq.com/q/4V33DrfgHe)
+  - No.3 [957189589](https://qm.qq.com/q/YNyTQjwlai)
 
 ## License
 

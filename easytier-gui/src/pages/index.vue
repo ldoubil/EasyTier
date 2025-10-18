@@ -13,6 +13,7 @@ import { NetworkTypes, Config, Status, Utils, I18nUtils, ConfigEditDialog } from
 import { isAutostart, setLoggingLevel } from '~/composables/network'
 import { useTray } from '~/composables/tray'
 import { getAutoLaunchStatusAsync as getAutoLaunchStatus, loadAutoLaunchStatusAsync } from '~/modules/auto_launch'
+import { getDockVisibilityStatus, loadDockVisibilityAsync } from '~/modules/dock_visibility'
 
 const { t, locale } = useI18n()
 const visible = ref(false)
@@ -144,8 +145,8 @@ onMounted(async () => {
 
   window.setTimeout(async () => {
     await setTrayMenu([
-      await MenuItemExit(t('tray.exit')),
       await MenuItemShow(t('tray.show')),
+      await MenuItemExit(t('tray.exit')),
     ])
   }, 1000)
 })
@@ -165,8 +166,8 @@ const setting_menu_items = ref([
     command: async () => {
       await I18nUtils.loadLanguageAsync((locale.value === 'en' ? 'cn' : 'en'))
       await setTrayMenu([
-        await MenuItemExit(t('tray.exit')),
         await MenuItemShow(t('tray.show')),
+        await MenuItemExit(t('tray.exit')),
       ])
     },
   },
@@ -176,6 +177,14 @@ const setting_menu_items = ref([
     command: async () => {
       await loadAutoLaunchStatusAsync(!getAutoLaunchStatus())
     },
+  },
+  {
+    label: () => getDockVisibilityStatus() ? t('hide_dock_icon') : t('show_dock_icon'),
+    icon: 'pi pi-eye-slash',
+    command: async () => {
+      await loadDockVisibilityAsync(!getDockVisibilityStatus())
+    },
+    visible: () => type() === 'macos',
   },
   {
     label: () => t('logging'),
@@ -283,61 +292,63 @@ async function saveTomlConfig(tomlConfig: string) {
       <About />
     </Dialog>
 
-    <div>
-      <Toolbar>
-        <template #start>
-          <div class="flex items-center">
-            <Button icon="pi pi-plus" severity="primary" :label="t('add_new_network')" @click="addNewNetwork" />
-          </div>
-        </template>
+    <div class="w-full">
+      <div class="flex items-center gap-4 p-4 h-20">
+        <!-- 网络按钮 -->
+        <div class="flex shrink-0 items-center">
+          <Button icon="pi pi-plus" severity="primary" :label="t('add_new_network')" class="hidden md:inline-flex"
+            @click="addNewNetwork" />
+          <Button icon="pi pi-plus" severity="primary" class="md:hidden px-6" @click="addNewNetwork" />
+        </div>
 
-        <template #center>
-          <div class="min-w-40">
-            <Select v-model="networkStore.curNetwork" :options="networkStore.networkList" :highlight-on-select="false"
-              :placeholder="t('select_network')" class="w-full">
-              <template #value="slotProps">
-                <div class="flex items-start content-center">
-                  <div class="mr-4 flex-col">
-                    <span>{{ slotProps.value.network_name }}</span>
-                  </div>
-                  <Tag class="my-auto leading-3" :severity="isRunning(slotProps.value.instance_id) ? 'success' : 'info'"
-                    :value="t(isRunning(slotProps.value.instance_id) ? 'network_running' : 'network_stopped')" />
+        <!-- 网络选择 - 占据中间剩余空间 -->
+        <Select v-model="networkStore.curNetwork" :options="networkStore.networkList" :highlight-on-select="false"
+          :placeholder="t('select_network')" class="flex-1 h-full min-w-0">
+          <template #value="slotProps">
+            <div class="flex items-center content-center min-w-0">
+              <div class="mr-4 flex-col min-w-0 flex-1">
+                <span class="truncate block"> &nbsp; {{ slotProps.value.network_name }}</span>
+              </div>
+              <Tag class="my-auto leading-3 shrink-0"
+                :severity="isRunning(slotProps.value.instance_id) ? 'success' : 'info'"
+                :value="t(isRunning(slotProps.value.instance_id) ? 'network_running' : 'network_stopped')" />
+            </div>
+          </template>
+          <template #option="slotProps">
+            <div class="flex flex-col items-start content-center max-w-full">
+              <div class="flex items-center min-w-0 w-full">
+                <div class="mr-4 min-w-0 flex-1">
+                  <span class="truncate block">{{ t('network_name') }}: {{ slotProps.option.network_name }}</span>
                 </div>
-              </template>
-              <template #option="slotProps">
-                <div class="flex flex-col items-start content-center max-w-full">
-                  <div class="flex">
-                    <div class="mr-4">
-                      {{ t('network_name') }}: {{ slotProps.option.network_name }}
-                    </div>
-                    <Tag class="my-auto leading-3"
-                      :severity="isRunning(slotProps.option.instance_id) ? 'success' : 'info'"
-                      :value="t(isRunning(slotProps.option.instance_id) ? 'network_running' : 'network_stopped')" />
-                  </div>
-                  <div v-if="slotProps.option.networking_method !== NetworkTypes.NetworkingMethod.Standalone"
-                    class="max-w-full overflow-hidden text-ellipsis">
-                    {{ slotProps.option.networking_method === NetworkTypes.NetworkingMethod.Manual
-                      ? slotProps.option.peer_urls.join(', ')
-                      : slotProps.option.public_server_url }}
-                  </div>
-                  <div
-                    v-if="isRunning(slotProps.option.instance_id) && networkStore.instances[slotProps.option.instance_id].detail && (!!networkStore.instances[slotProps.option.instance_id].detail?.my_node_info.virtual_ipv4)">
-                    {{
-                      Utils.ipv4InetToString(networkStore.instances[slotProps.option.instance_id].detail?.my_node_info.virtual_ipv4)
-                    }}
-                  </div>
-                </div>
-              </template>
-            </Select>
-          </div>
-        </template>
+                <Tag class="my-auto leading-3 shrink-0"
+                  :severity="isRunning(slotProps.option.instance_id) ? 'success' : 'info'"
+                  :value="t(isRunning(slotProps.option.instance_id) ? 'network_running' : 'network_stopped')" />
+              </div>
+              <div v-if="slotProps.option.networking_method !== NetworkTypes.NetworkingMethod.Standalone"
+                class="max-w-full overflow-hidden text-ellipsis">
+                {{ slotProps.option.networking_method === NetworkTypes.NetworkingMethod.Manual
+                  ? slotProps.option.peer_urls.join(', ')
+                  : slotProps.option.public_server_url }}
+              </div>
+              <div
+                v-if="isRunning(slotProps.option.instance_id) && networkStore.instances[slotProps.option.instance_id].detail && (!!networkStore.instances[slotProps.option.instance_id].detail?.my_node_info.virtual_ipv4)">
+                {{
+                  Utils.ipv4InetToString(networkStore.instances[slotProps.option.instance_id].detail?.my_node_info.virtual_ipv4)
+                }}
+              </div>
+            </div>
+          </template>
+        </Select>
 
-        <template #end>
+        <!-- 设置按钮 -->
+        <div class="flex items-center shrink-0">
           <Button icon="pi pi-cog" severity="secondary" aria-haspopup="true" :label="t('settings')"
+            class="hidden md:inline-flex" aria-controls="overlay_setting_menu" @click="toggle_setting_menu" />
+          <Button icon="pi pi-cog" severity="secondary" aria-haspopup="true" class="md:hidden px-6"
             aria-controls="overlay_setting_menu" @click="toggle_setting_menu" />
           <TieredMenu id="overlay_setting_menu" ref="setting_menu" :model="setting_menu_items" :popup="true" />
-        </template>
-      </Toolbar>
+        </div>
+      </div>
     </div>
 
     <Panel class="h-full overflow-y-auto">

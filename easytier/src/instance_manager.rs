@@ -9,7 +9,8 @@ use crate::{
         scoped_task::ScopedTask,
     },
     launcher::{ConfigSource, NetworkInstance, NetworkInstanceRunningInfo},
-    proto,
+    proto::{self},
+    rpc_service::InstanceRpcService,
 };
 
 pub struct NetworkInstanceManager {
@@ -83,6 +84,7 @@ impl NetworkInstanceManager {
                 }
                 stop_check_notifier.notify_one();
                 instance_stop_tasks.remove(&instance_id);
+                instance_stop_tasks.shrink_to_fit();
             })),
         );
         Ok(())
@@ -111,6 +113,7 @@ impl NetworkInstanceManager {
         instance_ids: Vec<uuid::Uuid>,
     ) -> Result<Vec<uuid::Uuid>, anyhow::Error> {
         self.instance_map.retain(|k, _| instance_ids.contains(k));
+        self.instance_map.shrink_to_fit();
         Ok(self.list_network_instance_ids())
     }
 
@@ -119,19 +122,37 @@ impl NetworkInstanceManager {
         instance_ids: Vec<uuid::Uuid>,
     ) -> Result<Vec<uuid::Uuid>, anyhow::Error> {
         self.instance_map.retain(|k, _| !instance_ids.contains(k));
+        self.instance_map.shrink_to_fit();
         Ok(self.list_network_instance_ids())
     }
 
-    pub fn collect_network_infos(
+    pub async fn collect_network_infos(
         &self,
     ) -> Result<BTreeMap<uuid::Uuid, NetworkInstanceRunningInfo>, anyhow::Error> {
         let mut ret = BTreeMap::new();
         for instance in self.instance_map.iter() {
-            if let Some(info) = instance.get_running_info() {
+            if let Ok(info) = instance.get_running_info().await {
                 ret.insert(*instance.key(), info);
             }
         }
         Ok(ret)
+    }
+
+    pub fn collect_network_infos_sync(
+        &self,
+    ) -> Result<BTreeMap<uuid::Uuid, NetworkInstanceRunningInfo>, anyhow::Error> {
+        tokio::runtime::Runtime::new()?.block_on(self.collect_network_infos())
+    }
+
+    pub async fn get_network_info(
+        &self,
+        instance_id: &uuid::Uuid,
+    ) -> Option<NetworkInstanceRunningInfo> {
+        self.instance_map
+            .get(instance_id)?
+            .get_running_info()
+            .await
+            .ok()
     }
 
     pub fn list_network_instance_ids(&self) -> Vec<uuid::Uuid> {
@@ -142,6 +163,26 @@ impl NetworkInstanceManager {
         self.instance_map
             .get(instance_id)
             .map(|instance| instance.value().get_inst_name())
+    }
+
+    pub fn filter_network_instance(
+        &self,
+        filter: impl Fn(&uuid::Uuid, &NetworkInstance) -> bool,
+    ) -> Vec<uuid::Uuid> {
+        self.instance_map
+            .iter()
+            .filter(|item| filter(item.key(), item.value()))
+            .map(|item| *item.key())
+            .collect()
+    }
+
+    pub fn get_instance_service(
+        &self,
+        instance_id: &uuid::Uuid,
+    ) -> Option<Arc<dyn InstanceRpcService>> {
+        self.instance_map
+            .get(instance_id)
+            .and_then(|instance| instance.value().get_api_service())
     }
 
     pub fn set_tun_fd(&self, instance_id: &uuid::Uuid, fd: i32) -> Result<(), anyhow::Error> {
@@ -264,6 +305,13 @@ fn handle_event(
                         );
                     }
 
+                    GlobalCtxEvent::VpnPortalStarted(portal) => {
+                        print_event(
+                            instance_id,
+                            format!("vpn portal started. portal: {}", portal),
+                        );
+                    }
+
                     GlobalCtxEvent::VpnPortalClientConnected(portal, client_addr) => {
                         print_event(
                             instance_id,
@@ -306,6 +354,10 @@ fn handle_event(
                             ),
                         );
                     }
+
+                    GlobalCtxEvent::ConfigPatched(patch) => {
+                        print_event(instance_id, format!("config patched. patch: {:?}", patch));
+                    }
                 }
             } else {
                 events = events.resubscribe();
@@ -323,7 +375,7 @@ fn print_event(instance_id: uuid::Uuid, msg: String) {
     );
 }
 
-fn peer_conn_info_to_string(p: proto::cli::PeerConnInfo) -> String {
+fn peer_conn_info_to_string(p: proto::api::instance::PeerConnInfo) -> String {
     format!(
         "my_peer_id: {}, dst_peer_id: {}, tunnel_info: {:?}",
         p.my_peer_id, p.peer_id, p.tunnel

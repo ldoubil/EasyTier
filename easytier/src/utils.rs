@@ -2,11 +2,15 @@ use std::{fs::OpenOptions, str::FromStr};
 
 use anyhow::Context;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{
+    layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
+};
 
-use crate::common::{config::LoggingConfigLoader, get_logger_timer_rfc3339};
+use crate::common::{
+    config::LoggingConfigLoader, get_logger_timer_rfc3339, tracing_rolling_appender::*,
+};
 
-pub type PeerRoutePair = crate::proto::cli::PeerRoutePair;
+pub type PeerRoutePair = crate::proto::api::instance::PeerRoutePair;
 
 pub fn cost_to_str(cost: i32) -> String {
     if cost == 1 {
@@ -26,6 +30,8 @@ pub fn init_logger(
     config: impl LoggingConfigLoader,
     need_reload: bool,
 ) -> Result<Option<NewFilterSender>, anyhow::Error> {
+    use crate::rpc_service::logger::{CURRENT_LOG_LEVEL, LOGGER_LEVEL_SENDER};
+
     let file_config = config.get_file_logger_config();
     let file_level = file_config
         .level
@@ -48,7 +54,12 @@ pub fn init_logger(
 
         if need_reload {
             let (sender, recver) = std::sync::mpsc::channel();
-            ret_sender = Some(sender);
+            ret_sender = Some(sender.clone());
+
+            // 初始化全局状态
+            let _ = LOGGER_LEVEL_SENDER.set(std::sync::Mutex::new(sender));
+            let _ = CURRENT_LOG_LEVEL.set(std::sync::Mutex::new(file_level.to_string()));
+
             std::thread::spawn(move || {
                 println!("Start log filter reloader");
                 while let Ok(lf) = recver.recv() {
@@ -70,15 +81,25 @@ pub fn init_logger(
             });
         }
 
-        let file_appender = tracing_appender::rolling::Builder::new()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .max_log_files(5)
-            .filename_prefix(file_config.file.unwrap_or("easytier".to_string()))
-            .filename_suffix("log")
-            .build(file_config.dir.unwrap_or("./".to_string()))
-            .with_context(|| "failed to initialize rolling file appender")?;
+        let dir = file_config.dir.as_deref().unwrap_or(".");
+        let file = file_config.file.as_deref().unwrap_or("easytier.log");
+        let path = std::path::Path::new(dir).join(file);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let builder = RollingFileAppenderBase::builder();
+        let file_appender = builder
+            .filename(path_str)
+            .condition_daily()
+            .max_filecount(file_config.count.unwrap_or(10))
+            .condition_max_file_size(file_config.size_mb.unwrap_or(100) * 1024 * 1024)
+            .build()
+            .unwrap();
+
+        let wrapper = FileAppenderWrapper::new(file_appender);
+
+        // Create a simple wrapper that implements MakeWriter
         file_layer = Some(
-            l.with_writer(file_appender)
+            l.with_writer(wrapper)
                 .with_timer(get_logger_timer_rfc3339())
                 .with_filter(file_filter),
         );
@@ -102,10 +123,22 @@ pub fn init_logger(
         .with_writer(std::io::stderr)
         .with_filter(console_filter);
 
-    tracing_subscriber::Registry::default()
-        .with(console_layer)
-        .with(file_layer)
-        .init();
+    let registry = Registry::default();
+
+    #[cfg(not(feature = "tracing"))]
+    {
+        registry.with(console_layer).with(file_layer).init();
+    }
+
+    #[cfg(feature = "tracing")]
+    {
+        let console_subscriber_layer = console_subscriber::ConsoleLayer::builder().spawn();
+        registry
+            .with(console_layer)
+            .with(file_layer)
+            .with(console_subscriber_layer)
+            .init();
+    }
 
     Ok(ret_sender)
 }
@@ -219,6 +252,11 @@ pub fn check_tcp_available(port: u16) -> bool {
 
 pub fn find_free_tcp_port(mut range: std::ops::Range<u16>) -> Option<u16> {
     range.find(|&port| check_tcp_available(port))
+}
+
+pub fn weak_upgrade<T>(weak: &std::sync::Weak<T>) -> anyhow::Result<std::sync::Arc<T>> {
+    weak.upgrade()
+        .ok_or_else(|| anyhow::anyhow!("{} not available", std::any::type_name::<T>()))
 }
 
 #[cfg(test)]

@@ -31,6 +31,23 @@ fn easytier_version() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn set_dock_visibility(app: tauri::AppHandle, visible: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::ActivationPolicy;
+        app.set_activation_policy(if visible {
+            ActivationPolicy::Regular
+        } else {
+            ActivationPolicy::Accessory
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, visible);
+    Ok(())
+}
+
+#[tauri::command]
 fn is_autostart() -> Result<bool, String> {
     let args: Vec<String> = std::env::args().collect();
     println!("{:?}", args);
@@ -76,9 +93,10 @@ fn retain_network_instance(instance_ids: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn collect_network_infos() -> Result<BTreeMap<String, NetworkInstanceRunningInfo>, String> {
+async fn collect_network_infos() -> Result<BTreeMap<String, NetworkInstanceRunningInfo>, String> {
     let infos = INSTANCE_MANAGER
         .collect_network_infos()
+        .await
         .map_err(|e| e.to_string())?;
 
     let mut ret = BTreeMap::new();
@@ -199,6 +217,8 @@ pub fn run() {
                     dir: Some(log_dir.to_string_lossy().to_string()),
                     level: None,
                     file: None,
+                    size_mb: None,
+                    count: None,
                 })
                 .build()
                 .map_err(|e| e.to_string())?;
@@ -243,7 +263,8 @@ pub fn run() {
             set_logging_level,
             set_tun_fd,
             is_autostart,
-            easytier_version
+            easytier_version,
+            set_dock_visibility
         ])
         .on_window_event(|_win, event| match event {
             #[cfg(not(target_os = "android"))]

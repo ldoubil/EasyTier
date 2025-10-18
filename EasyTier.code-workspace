@@ -28,6 +28,10 @@
 			"path": "easytier-contrib/easytier-ohrs"
 		},
 		{
+			"name": "uptime",
+			"path": "easytier-contrib/easytier-uptime"
+		},
+		{
 			"name": "vpnservice",
 			"path": "tauri-plugin-vpnservice"
 		},
@@ -46,5 +50,8 @@
 		"editor.formatOnSaveMode": "modifications",
 		"editor.formatOnPaste": false,
 		"editor.formatOnType": true,
+		"[nix]": {
+			"editor.formatOnSave": false,
+		},
 	}
 }

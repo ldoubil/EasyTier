@@ -24,6 +24,7 @@ use crate::{
         constants::EASYTIER_VERSION,
         error::Error,
         global_ctx::{ArcGlobalCtx, NetworkIdentity},
+        shrink_dashmap,
         stats_manager::{CounterHandle, LabelSet, LabelType, MetricName},
         stun::StunInfoCollectorTrait,
         PeerId,
@@ -32,15 +33,17 @@ use crate::{
         peer_conn::PeerConn,
         peer_rpc::PeerRpcManagerTransport,
         recv_packet_from_chan,
-        route_trait::{ForeignNetworkRouteInfoMap, NextHopPolicy, RouteInterface},
+        route_trait::{ForeignNetworkRouteInfoMap, MockRoute, NextHopPolicy, RouteInterface},
         PeerPacketFilter,
     },
     proto::{
-        cli::{
+        api::instance::{
             self, list_global_foreign_network_response::OneForeignNetwork,
             ListGlobalForeignNetworkResponse,
         },
-        peer_rpc::{ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey},
+        peer_rpc::{
+            ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey, RouteForeignNetworkSummary,
+        },
     },
     tunnel::{
         self,
@@ -150,7 +153,7 @@ pub struct PeerManager {
     encryptor: Arc<dyn Encryptor + 'static>,
     data_compress_algo: CompressorAlgo,
 
-    exit_nodes: Vec<IpAddr>,
+    exit_nodes: RwLock<Vec<IpAddr>>,
 
     reserved_my_peer_id_map: DashMap<String, PeerId>,
 
@@ -302,7 +305,7 @@ impl PeerManager {
             encryptor,
             data_compress_algo,
 
-            exit_nodes,
+            exit_nodes: RwLock::new(exit_nodes),
 
             reserved_my_peer_id_map: DashMap::new(),
 
@@ -512,6 +515,7 @@ impl PeerManager {
         }
 
         self.reserved_my_peer_id_map.remove(&peer_network_name);
+        shrink_dashmap(&self.reserved_my_peer_id_map, None);
 
         tracing::info!("add tunnel as server done");
         Ok(())
@@ -632,6 +636,7 @@ impl PeerManager {
         let acl_filter = self.global_ctx.get_acl_filter().clone();
         let global_ctx = self.global_ctx.clone();
         let stats_mgr = self.global_ctx.stats_manager().clone();
+        let route = self.get_route();
 
         let label_set =
             LabelSet::new().with_label_type(LabelType::NetworkName(global_ctx.get_network_name()));
@@ -735,6 +740,7 @@ impl PeerManager {
                         true,
                         global_ctx.get_ipv4().map(|x| x.address()),
                         global_ctx.get_ipv6().map(|x| x.address()),
+                        &route,
                     ) {
                         continue;
                     }
@@ -912,11 +918,11 @@ impl PeerManager {
     pub fn get_route(&self) -> Box<dyn Route + Send + Sync + 'static> {
         match &self.route_algo_inst {
             RouteAlgoInst::Ospf(route) => Box::new(route.clone()),
-            RouteAlgoInst::None => panic!("no route"),
+            RouteAlgoInst::None => Box::new(MockRoute {}),
         }
     }
 
-    pub async fn list_routes(&self) -> Vec<cli::Route> {
+    pub async fn list_routes(&self) -> Vec<instance::Route> {
         self.get_route().list_routes().await
     }
 
@@ -953,12 +959,18 @@ impl PeerManager {
         resp
     }
 
+    pub async fn get_foreign_network_summary(&self) -> RouteForeignNetworkSummary {
+        self.get_route().get_foreign_network_summary().await
+    }
+
     async fn run_nic_packet_process_pipeline(&self, data: &mut ZCPacket) {
-        if !self
-            .global_ctx
-            .get_acl_filter()
-            .process_packet_with_acl(data, false, None, None)
-        {
+        if !self.global_ctx.get_acl_filter().process_packet_with_acl(
+            data,
+            false,
+            None,
+            None,
+            &self.get_route(),
+        ) {
             return;
         }
 
@@ -985,11 +997,21 @@ impl PeerManager {
         }
     }
 
-    pub async fn send_msg(&self, msg: ZCPacket, dst_peer_id: PeerId) -> Result<(), Error> {
+    pub async fn send_msg_for_proxy(
+        &self,
+        mut msg: ZCPacket,
+        dst_peer_id: PeerId,
+    ) -> Result<(), Error> {
         self.self_tx_counters
-            .self_tx_bytes
+            .compress_tx_bytes_before
             .add(msg.buf_len() as u64);
-        self.self_tx_counters.self_tx_packets.inc();
+
+        Self::try_compress_and_encrypt(self.data_compress_algo, &self.encryptor, &mut msg).await?;
+
+        self.self_tx_counters
+            .compress_tx_bytes_after
+            .add(msg.buf_len() as u64);
+
         let msg_len = msg.buf_len() as u64;
         let result =
             Self::send_msg_internal(&self.peers, &self.foreign_network_client, msg, dst_peer_id)
@@ -1045,11 +1067,20 @@ impl PeerManager {
             || ipv4_addr.is_multicast()
             || *ipv4_addr == ipv4_inet.last_address()
         {
-            dst_peers.extend(self.peers.list_routes().await.iter().map(|x| *x.key()));
+            dst_peers.extend(self.peers.list_routes().await.iter().filter_map(|x| {
+                if *x.key() != self.my_peer_id {
+                    Some(*x.key())
+                } else {
+                    None
+                }
+            }));
         } else if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(ipv4_addr).await {
             dst_peers.push(peer_id);
-        } else {
-            for exit_node in &self.exit_nodes {
+        } else if !self
+            .global_ctx
+            .is_ip_in_same_network(&std::net::IpAddr::V4(*ipv4_addr))
+        {
+            for exit_node in self.exit_nodes.read().await.iter() {
                 let IpAddr::V4(exit_node) = exit_node else {
                     continue;
                 };
@@ -1062,8 +1093,12 @@ impl PeerManager {
         }
         #[cfg(target_env = "ohos")]
         {
-            if dst_peers.is_empty() {
-                tracing::info!("no peer id for ipv4: {}, set exit_node for ohos", ipv4_addr);
+            if dst_peers.is_empty()
+                && !self
+                    .global_ctx
+                    .is_ip_in_same_network(&std::net::IpAddr::V4(*ipv4_addr))
+            {
+                tracing::trace!("no peer id for ipv4: {}, set exit_node for ohos", ipv4_addr);
                 dst_peers.push(self.my_peer_id.clone());
                 is_exit_node = true;
             }
@@ -1086,7 +1121,7 @@ impl PeerManager {
             dst_peers.push(peer_id);
         } else if !ipv6_addr.is_unicast_link_local() {
             // NOTE: never route link local address to exit node.
-            for exit_node in &self.exit_nodes {
+            for exit_node in self.exit_nodes.read().await.iter() {
                 let IpAddr::V6(exit_node) = exit_node else {
                     continue;
                 };
@@ -1272,8 +1307,8 @@ impl PeerManager {
         self.foreign_network_client.clone()
     }
 
-    pub async fn get_my_info(&self) -> cli::NodeInfo {
-        cli::NodeInfo {
+    pub async fn get_my_info(&self) -> instance::NodeInfo {
+        instance::NodeInfo {
             peer_id: self.my_peer_id,
             ipv4_addr: self
                 .global_ctx
@@ -1376,6 +1411,11 @@ impl PeerManager {
             return false;
         };
 
+        if next_hop_id == dst_peer_id {
+            // dst p2p, no need to relay
+            return true;
+        }
+
         let Some(next_hop_info) = route.get_peer_info(next_hop_id).await else {
             return false;
         };
@@ -1390,6 +1430,11 @@ impl PeerManager {
         }
 
         true
+    }
+
+    pub async fn update_exit_nodes(&self) {
+        let exit_nodes = self.global_ctx.config.get_exit_nodes();
+        *self.exit_nodes.write().await = exit_nodes;
     }
 }
 

@@ -25,7 +25,7 @@ pub fn del_netns(name: &str) {
         .output();
 }
 
-pub fn create_netns(name: &str, ipv4: &str) {
+pub fn create_netns(name: &str, ipv4: &str, ipv6: &str) {
     // create netns
     let _ = std::process::Command::new("ip")
         .args(["netns", "add", name])
@@ -76,20 +76,22 @@ pub fn create_netns(name: &str, ipv4: &str) {
         .output()
         .unwrap();
 
-    let _ = std::process::Command::new("ip")
-        .args([
-            "netns",
-            "exec",
-            name,
-            "ip",
-            "addr",
-            "add",
-            ipv4,
-            "dev",
-            get_guest_veth_name(name),
-        ])
-        .output()
-        .unwrap();
+    for ip in [ipv4, ipv6] {
+        let _ = std::process::Command::new("ip")
+            .args([
+                "netns",
+                "exec",
+                name,
+                "ip",
+                "addr",
+                "add",
+                ip,
+                "dev",
+                get_guest_veth_name(name),
+            ])
+            .output()
+            .unwrap();
+    }
 }
 
 pub fn prepare_bridge(name: &str) {
@@ -130,7 +132,7 @@ pub fn enable_log() {
         .init();
 }
 
-fn check_route(ipv4: &str, dst_peer_id: PeerId, routes: Vec<crate::proto::cli::Route>) {
+fn check_route(ipv4: &str, dst_peer_id: PeerId, routes: Vec<crate::proto::api::instance::Route>) {
     let mut found = false;
     for r in routes.iter() {
         if r.ipv4_addr == Some(ipv4.parse().unwrap()) {
@@ -143,6 +145,21 @@ fn check_route(ipv4: &str, dst_peer_id: PeerId, routes: Vec<crate::proto::cli::R
         "routes: {:?}, dst_peer_id: {}, ipv4: {}",
         routes, dst_peer_id, ipv4
     );
+}
+
+fn check_route_ex(
+    routes: Vec<crate::proto::api::instance::Route>,
+    peer_id: PeerId,
+    checker: impl Fn(&crate::proto::api::instance::Route) -> bool,
+) {
+    let mut found = false;
+    for r in routes.iter() {
+        if r.peer_id == peer_id {
+            found = true;
+            assert!(checker(r), "{:?}", routes);
+        }
+    }
+    assert!(found, "routes: {:?}, dst_peer_id: {}", routes, peer_id);
 }
 
 async fn wait_proxy_route_appear(

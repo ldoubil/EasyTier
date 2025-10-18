@@ -44,8 +44,12 @@ logging_open_dir: Open Log Directory
 logging_copy_dir: Copy Log Path
 disable_auto_launch: Disable Launch on Reboot
 enable_auto_launch: Enable Launch on Reboot
+hide_dock_icon: Hide Dock Icon
+show_dock_icon: Show Dock Icon
 exit: Exit
 use_latency_first: Latency First Mode
+show_node_details: Show Node Details
+hide_node_details: Hide Node Details
 chips_placeholder: 'e.g: {0}, select from the dropdown after input'
 hostname_placeholder: 'Leave blank and default to host name: {0}'
 dev_name_placeholder: 'Note: When multiple networks use the same TUN interface name at the same time, there will be a conflict when setting the TUN''s IP. Leave blank to automatically generate a random name.'
@@ -73,6 +77,7 @@ latency: Latency
 upload_bytes: Upload
 download_bytes: Download
 loss_rate: Loss Rate
+nat_type: NAT Type
 
 flags_switch: Feature Switch
 
@@ -125,6 +130,9 @@ disable_encryption_help: Disable encryption for peers communication, default is 
 
 disable_udp_hole_punching: Disable UDP Hole Punching
 disable_udp_hole_punching_help: Disable udp hole punching
+
+disable_sym_hole_punching: Disable Symmetric NAT Hole Punching
+disable_sym_hole_punching_help: Disable special hole punching handling for symmetric NAT (based on birthday attack), treat symmetric NAT as cone NAT
 
 enable_magic_dns: Enable Magic DNS
 enable_magic_dns_help: |
@@ -207,6 +215,7 @@ event:
   ConnectionError: ConnectionError
   Connecting: Connecting
   ConnectError: ConnectError
+  VpnPortalStarted: VpnPortalStarted
   VpnPortalClientConnected: VpnPortalClientConnected
   VpnPortalClientDisconnected: VpnPortalClientDisconnected
   DhcpIpv4Changed: DhcpIpv4Changed
@@ -324,4 +333,4 @@ web:
     confirm_password: Confirm New Password
     language: Language
     theme: Theme
-    logout: Logout 
+    logout: Logout

@@ -21,10 +21,13 @@ use rand::RngCore;
 use tokio::{net::UdpSocket, sync::Mutex, task::JoinSet};
 
 use super::TunnelInfo;
-use crate::tunnel::{
-    build_url_from_socket_addr,
-    common::TunnelWrapper,
-    packet_def::{ZCPacket, WG_TUNNEL_HEADER_SIZE},
+use crate::{
+    common::shrink_dashmap,
+    tunnel::{
+        build_url_from_socket_addr,
+        common::TunnelWrapper,
+        packet_def::{ZCPacket, WG_TUNNEL_HEADER_SIZE},
+    },
 };
 
 use super::{
@@ -491,12 +494,13 @@ impl WgTunnelListener {
     ) {
         let mut tasks = JoinSet::new();
 
-        let peer_map_clone = peer_map.clone();
+        let peer_map_clone: Arc<DashMap<SocketAddr, Arc<WgPeer>>> = peer_map.clone();
         tasks.spawn(async move {
             loop {
                 peer_map_clone.retain(|_, peer| {
                     peer.access_time.load().elapsed().as_secs() < 61 && !peer.stopped()
                 });
+                shrink_dashmap(&peer_map_clone, None);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
@@ -629,7 +633,10 @@ impl WgTunnelConnector {
         addr: SocketAddr,
     ) -> Result<Box<dyn super::Tunnel>, super::TunnelError> {
         tracing::warn!("wg connect: {:?}", addr);
-        let local_addr = udp.local_addr().unwrap().to_string();
+        let local_addr = udp
+            .local_addr()
+            .with_context(|| "Failed to get local addr")?
+            .to_string();
 
         let mut wg_peer = WgPeer::new(Arc::new(udp), config.clone(), addr);
         let udp = wg_peer.udp_socket();

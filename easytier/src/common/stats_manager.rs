@@ -66,6 +66,8 @@ pub enum MetricName {
     CompressionBytesTxBefore,
     /// Compression bytes after compression
     CompressionBytesTxAfter,
+
+    TcpProxyConnect,
 }
 
 impl fmt::Display for MetricName {
@@ -112,6 +114,8 @@ impl fmt::Display for MetricName {
             MetricName::CompressionBytesRxAfter => write!(f, "compression_bytes_rx_after"),
             MetricName::CompressionBytesTxBefore => write!(f, "compression_bytes_tx_before"),
             MetricName::CompressionBytesTxAfter => write!(f, "compression_bytes_tx_after"),
+
+            MetricName::TcpProxyConnect => write!(f, "tcp_proxy_connect"),
         }
     }
 }
@@ -139,6 +143,10 @@ pub enum LabelType {
     ErrorType(String),
     /// Status
     Status(String),
+    /// Dst Ip
+    DstIp(String),
+    /// Mapped Dst Ip
+    MappedDstIp(String),
 }
 
 impl fmt::Display for LabelType {
@@ -154,6 +162,8 @@ impl fmt::Display for LabelType {
             LabelType::CompressionAlgo(algo) => write!(f, "compression_algo={}", algo),
             LabelType::ErrorType(err) => write!(f, "error_type={}", err),
             LabelType::Status(status) => write!(f, "status={}", status),
+            LabelType::DstIp(ip) => write!(f, "dst_ip={}", ip),
+            LabelType::MappedDstIp(ip) => write!(f, "mapped_dst_ip={}", ip),
         }
     }
 }
@@ -171,6 +181,8 @@ impl LabelType {
             LabelType::CompressionAlgo(_) => "compression_algo",
             LabelType::ErrorType(_) => "error_type",
             LabelType::Status(_) => "status",
+            LabelType::DstIp(_) => "dst_ip",
+            LabelType::MappedDstIp(_) => "mapped_dst_ip",
         }
     }
 
@@ -186,6 +198,8 @@ impl LabelType {
             LabelType::CompressionAlgo(algo) => algo.clone(),
             LabelType::ErrorType(err) => err.clone(),
             LabelType::Status(status) => status.clone(),
+            LabelType::DstIp(ip) => ip.clone(),
+            LabelType::MappedDstIp(ip) => ip.clone(),
         }
     }
 }
@@ -501,7 +515,9 @@ impl StatsManager {
             loop {
                 interval.tick().await;
 
-                let cutoff_time = Instant::now() - Duration::from_secs(180); // 3 minutes
+                let Some(cutoff_time) = Instant::now().checked_sub(Duration::from_secs(180)) else {
+                    continue;
+                };
 
                 let Some(counters) = counters_clone.upgrade() else {
                     break;
@@ -511,6 +527,7 @@ impl StatsManager {
                 counters.retain(|_, metric_data: &mut Arc<MetricData>| unsafe {
                     metric_data.get_last_updated() > cutoff_time
                 });
+                counters.shrink_to_fit();
             }
         });
 
@@ -648,7 +665,7 @@ impl Default for StatsManager {
 mod tests {
     use super::*;
     use crate::common::stats_manager::{LabelSet, LabelType, MetricName, StatsManager};
-    use crate::proto::cli::{
+    use crate::proto::api::instance::{
         GetPrometheusStatsRequest, GetPrometheusStatsResponse, GetStatsRequest, GetStatsResponse,
     };
     use std::collections::BTreeMap;
@@ -802,16 +819,19 @@ mod tests {
     #[tokio::test]
     async fn test_stats_rpc_data_structures() {
         // Test GetStatsRequest
-        let request = GetStatsRequest {};
-        assert_eq!(request, GetStatsRequest {});
+        let request = GetStatsRequest { instance: None };
+        assert_eq!(request, GetStatsRequest { instance: None });
 
         // Test GetStatsResponse
         let response = GetStatsResponse { metrics: vec![] };
         assert!(response.metrics.is_empty());
 
         // Test GetPrometheusStatsRequest
-        let prometheus_request = GetPrometheusStatsRequest {};
-        assert_eq!(prometheus_request, GetPrometheusStatsRequest {});
+        let prometheus_request = GetPrometheusStatsRequest { instance: None };
+        assert_eq!(
+            prometheus_request,
+            GetPrometheusStatsRequest { instance: None }
+        );
 
         // Test GetPrometheusStatsResponse
         let prometheus_response = GetPrometheusStatsResponse {
@@ -851,7 +871,7 @@ mod tests {
             }
 
             // This simulates what the RPC service would do
-            let _metric_snapshot = crate::proto::cli::MetricSnapshot {
+            let _metric_snapshot = crate::proto::api::instance::MetricSnapshot {
                 name: metric.name.to_string(),
                 value: metric.value,
                 labels,

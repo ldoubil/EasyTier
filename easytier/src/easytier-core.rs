@@ -29,7 +29,7 @@ use easytier::{
     connector::create_connector_by_url,
     defer,
     instance_manager::NetworkInstanceManager,
-    launcher::{add_proxy_network_to_config, ConfigSource},
+    launcher::add_proxy_network_to_config,
     proto::common::{CompressionAlgoPb, NatType},
     rpc_service::ApiRpcServer,
     tunnel::{IpVersion, PROTO_PORT_OFFSET},
@@ -1169,6 +1169,9 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         let token = config_server_url
             .path_segments()
             .and_then(|mut x| x.next())
+            .map(|x| percent_encoding::percent_decode_str(x).decode_utf8())
+            .transpose()
+            .with_context(|| "failed to decode config server token")?
             .map(|x| x.to_string())
             .unwrap_or_default();
 
@@ -1233,7 +1236,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             println!("############### TOML ###############\n");
             println!("{}", cfg.dump());
             println!("-----------------------------------");
-            manager.run_network_instance(cfg, ConfigSource::File)?;
+            manager.run_network_instance(cfg, true)?;
         }
     }
 
@@ -1246,7 +1249,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         println!("############### TOML ###############\n");
         println!("{}", cfg.dump());
         println!("-----------------------------------");
-        manager.run_network_instance(cfg, ConfigSource::Cli)?;
+        manager.run_network_instance(cfg, true)?;
     }
 
     tokio::select! {

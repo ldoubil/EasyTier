@@ -106,6 +106,9 @@ disable_quic_input_help: 禁用 QUIC 入站流量，其他开启 QUIC 代理的�
 disable_p2p: 禁用 P2P
 disable_p2p_help: 禁用 P2P 模式，所有流量通过手动指定的服务器中转。
 
+p2p_only: 仅 P2P
+p2p_only_help: 仅与已经建立P2P连接的对等节点通信，不通过其他节点中转。
+
 bind_device: 仅使用物理网卡
 bind_device_help: 仅使用物理网卡，避免 EasyTier 通过其他虚拟网建立连接。
 
@@ -128,6 +131,9 @@ proxy_forward_by_system_help: 通过系统内核转发子网代理数据包，�
 
 disable_encryption: 禁用加密
 disable_encryption_help: 禁用对等节点通信的加密，默认为false，必须与对等节点相同
+
+disable_tcp_hole_punching: 禁用TCP打洞
+disable_tcp_hole_punching_help: 禁用TCP打洞功能
 
 disable_udp_hole_punching: 禁用UDP打洞
 disable_udp_hole_punching_help: 禁用UDP打洞功能
@@ -337,3 +343,49 @@ web:
     language: 语言
     theme: 主题
     logout: 退出登录
+
+mode:
+  title: 模式
+  switch_mode: 切换模式
+  config_dir: 配置目录
+  rpc_portal: RPC端口
+  log_level: 日志级别
+  log_dir: 日志目录
+  remote_rpc_address: 远程RPC地址
+  normal: 普通模式
+  service: 服务模式
+  remote: 远程模式
+  normal_description: 直接运行EasyTier，适合本地使用
+  service_description: 作为系统服务运行，支持开机自启和后台运行。退出GUI后服务仍在后台运行。
+  remote_description: 连接到远程RPC服务，管理和控制远程节点
+  service_status: 服务状态
+  service_status_running: 运行中
+  service_status_stopped: 已停止
+  service_status_notinstalled: 未安装
+  uninstall_service: 卸载服务
+  stop_service: 停止服务
+  uninstall_service_confirm: 确定要卸载服务吗？
+  uninstall_service_success: 服务卸载成功，已切换回普通模式
+  stop_service_success: 服务停止成功
+  remote_rpc_address_empty: 远程RPC地址不能为空
+  service_config_empty: 服务配置不能为空
+
+config-server:
+  title: 配置服务器
+  address: 配置服务器地址
+  address_placeholder: 例如：udp://127.0.0.1:22020/admin 或 admin
+  description: |
+    配置服务器地址，支持以下格式：
+    完整URL：udp://127.0.0.1:22020/admin
+    仅用户名：admin（使用官方服务器）
+    留空：不连接配置服务器
+  connection_status: 连接状态
+  connected: ": 已连接"
+  disconnected: ": 未连接"
+  connecting: ": 连接中..."
+  unknown: ""
+  update_service_confirm: 将重启服务以应用更改，是否继续？
+
+client:
+  not_running: 无法连接至远程客户端
+  retry: 重试

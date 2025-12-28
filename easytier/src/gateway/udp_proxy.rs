@@ -85,7 +85,7 @@ impl UdpNatEntry {
 
     async fn compose_ipv4_packet(
         self: &Arc<Self>,
-        packet_sender: &mut Sender<ZCPacket>,
+        packet_sender: &Sender<ZCPacket>,
         buf: &mut [u8],
         src_v4: &SocketAddrV4,
         payload_len: usize,
@@ -139,7 +139,7 @@ impl UdpNatEntry {
 
     async fn forward_task(
         self: Arc<Self>,
-        mut packet_sender: Sender<ZCPacket>,
+        packet_sender: Sender<ZCPacket>,
         virtual_ipv4: Ipv4Addr,
         real_ipv4: Ipv4Addr,
         mapped_ipv4: Ipv4Addr,
@@ -207,7 +207,7 @@ impl UdpNatEntry {
 
                 let Ok(_) = Self::compose_ipv4_packet(
                     &self_clone,
-                    &mut packet_sender,
+                    &packet_sender,
                     &mut packet,
                     &src_v4,
                     len,
@@ -437,7 +437,7 @@ impl UdpProxy {
         // forward packets to peer manager
         let mut receiver = self.receiver.lock().await.take().unwrap();
         let peer_manager = self.peer_manager.clone();
-        let is_latency_first = self.global_ctx.get_flags().latency_first;
+        let is_latency_first = self.global_ctx.latency_first();
         self.tasks.lock().await.spawn(async move {
             while let Some(mut msg) = receiver.recv().await {
                 let hdr = msg.mut_peer_manager_header().unwrap();

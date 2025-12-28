@@ -9,7 +9,7 @@ import {
   NetworkingMethod,
   removeRow
 } from '../types/network'
-import { defineProps, defineEmits, ref, onMounted } from 'vue'
+import { defineProps, defineEmits, ref, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 const props = defineProps<{
@@ -157,6 +157,7 @@ const bool_flags: BoolFlag[] = [
   { field: 'enable_quic_proxy', help: 'enable_quic_proxy_help' },
   { field: 'disable_quic_input', help: 'disable_quic_input_help' },
   { field: 'disable_p2p', help: 'disable_p2p_help' },
+  { field: 'p2p_only', help: 'p2p_only_help' },
   { field: 'bind_device', help: 'bind_device_help' },
   { field: 'no_tun', help: 'no_tun_help' },
   { field: 'enable_exit_node', help: 'enable_exit_node_help' },
@@ -164,6 +165,7 @@ const bool_flags: BoolFlag[] = [
   { field: 'multi_thread', help: 'multi_thread_help' },
   { field: 'proxy_forward_by_system', help: 'proxy_forward_by_system_help' },
   { field: 'disable_encryption', help: 'disable_encryption_help' },
+  { field: 'disable_tcp_hole_punching', help: 'disable_tcp_hole_punching_help' },
   { field: 'disable_udp_hole_punching', help: 'disable_udp_hole_punching_help' },
   { field: 'disable_sym_hole_punching', help: 'disable_sym_hole_punching_help' },
   { field: 'enable_magic_dns', help: 'enable_magic_dns_help' },
@@ -208,11 +210,11 @@ onMounted(() => {
     });
     resizeObserver.observe(portForwardContainer.value);
 
-    return () => {
+    onUnmounted(() => {
       if (resizeObserver && portForwardContainer.value) {
         resizeObserver.unobserve(portForwardContainer.value);
       }
-    }
+    });
   }
 });
 </script>

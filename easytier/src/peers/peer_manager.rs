@@ -242,7 +242,7 @@ impl PeerManager {
         ));
         let foreign_network_client = Arc::new(ForeignNetworkClient::new(
             global_ctx.clone(),
-            packet_send.clone(),
+            packet_send,
             peer_rpc_mgr.clone(),
             my_peer_id,
         ));
@@ -289,7 +289,7 @@ impl PeerManager {
 
             packet_recv: Arc::new(Mutex::new(Some(packet_recv))),
 
-            peers: peers.clone(),
+            peers,
 
             peer_rpc_mgr,
             peer_rpc_tspt: rpc_tspt,
@@ -997,11 +997,20 @@ impl PeerManager {
         }
     }
 
+    fn check_p2p_only_before_send(&self, dst_peer_id: PeerId) -> Result<(), Error> {
+        if self.global_ctx.p2p_only() && !self.peers.has_peer(dst_peer_id) {
+            return Err(Error::RouteError(None));
+        }
+        Ok(())
+    }
+
     pub async fn send_msg_for_proxy(
         &self,
         mut msg: ZCPacket,
         dst_peer_id: PeerId,
     ) -> Result<(), Error> {
+        self.check_p2p_only_before_send(dst_peer_id)?;
+
         self.self_tx_counters
             .compress_tx_bytes_before
             .add(msg.buf_len() as u64);
@@ -1054,7 +1063,14 @@ impl PeerManager {
         }
     }
 
-    pub async fn get_msg_dst_peer(&self, ipv4_addr: &Ipv4Addr) -> (Vec<PeerId>, bool) {
+    pub async fn get_msg_dst_peer(&self, addr: &IpAddr) -> (Vec<PeerId>, bool) {
+        match addr {
+            IpAddr::V4(ipv4_addr) => self.get_msg_dst_peer_ipv4(ipv4_addr).await,
+            IpAddr::V6(ipv6_addr) => self.get_msg_dst_peer_ipv6(ipv6_addr).await,
+        }
+    }
+
+    pub async fn get_msg_dst_peer_ipv4(&self, ipv4_addr: &Ipv4Addr) -> (Vec<PeerId>, bool) {
         let mut is_exit_node = false;
         let mut dst_peers = vec![];
         let network_length = self
@@ -1180,7 +1196,7 @@ impl PeerManager {
         }
 
         let (dst_peers, is_exit_node) = match ip_addr {
-            IpAddr::V4(ipv4_addr) => self.get_msg_dst_peer(&ipv4_addr).await,
+            IpAddr::V4(ipv4_addr) => self.get_msg_dst_peer_ipv4(&ipv4_addr).await,
             IpAddr::V6(ipv6_addr) => self.get_msg_dst_peer_ipv6(&ipv6_addr).await,
         };
 
@@ -1199,7 +1215,7 @@ impl PeerManager {
             .compress_tx_bytes_after
             .add(msg.buf_len() as u64);
 
-        let is_latency_first = self.global_ctx.get_flags().latency_first;
+        let is_latency_first = self.global_ctx.latency_first();
         msg.mut_peer_manager_header()
             .unwrap()
             .set_latency_first(is_latency_first)
@@ -1209,6 +1225,11 @@ impl PeerManager {
         let mut msg = Some(msg);
         let total_dst_peers = dst_peers.len();
         for (i, peer_id) in dst_peers.iter().enumerate() {
+            if let Err(e) = self.check_p2p_only_before_send(*peer_id) {
+                errs.push(e);
+                continue;
+            }
+
             let mut msg = if i == total_dst_peers - 1 {
                 msg.take().unwrap()
             } else {

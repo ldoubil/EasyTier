@@ -28,6 +28,7 @@ use crate::{
         proxy::TcpProxyRpcService, stats::StatsRpcService, vpn_portal::VpnPortalRpcService,
     },
     tunnel::{tcp::TcpTunnelListener, TunnelListener},
+    web_client::DefaultHooks,
 };
 
 pub struct ApiRpcServer<T: TunnelListener + 'static> {
@@ -69,6 +70,11 @@ impl<T: TunnelListener + 'static> ApiRpcServer<T> {
     pub async fn serve(mut self) -> Result<Self, Error> {
         self.rpc_server.serve().await?;
         Ok(self)
+    }
+
+    pub fn with_rx_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.rpc_server.set_rx_timeout(timeout);
+        self
     }
 }
 
@@ -137,7 +143,10 @@ fn register_api_rpc_service(
     );
 
     registry.register(
-        WebClientServiceServer::new(InstanceManageRpcService::new(instance_manager.clone())),
+        WebClientServiceServer::new(InstanceManageRpcService::new(
+            instance_manager.clone(),
+            Arc::new(DefaultHooks),
+        )),
         "",
     );
 }

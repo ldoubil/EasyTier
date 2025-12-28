@@ -147,6 +147,7 @@ network-interface = "2.0"
 # for ospf route
 petgraph = "0.8.1"
 hashbrown = "0.15.3"
+ordered_hash_map = "0.5.0"
 
 # for wireguard
 boringtun = { package = "boringtun-easytier", version = "0.6.1", optional = true }
@@ -197,7 +198,7 @@ sys-locale = "0.3"
 ringbuf = "0.4.5"
 async-ringbuf = "0.3.1"
 
-service-manager = { git = "https://github.com/chipsenkbeil/service-manager-rs.git", branch = "main" }
+service-manager = { git = "https://github.com/EasyTier/service-manager-rs.git", branch = "main" }
 
 zstd = { version = "0.13" }
 
@@ -221,10 +222,15 @@ hickory-client = "0.25.2"
 hickory-server = { version = "0.25.2", features = ["resolver"] }
 derive_builder = "0.20.2"
 humantime-serde = "1.1.1"
-multimap = "0.10.0"
+multimap = "0.10.1"
 version-compare = "0.2.0"
 hmac = "0.12.1"
 sha2 = "0.10.8"
+shellexpand = "3.1.1"
+
+# for fake tcp
+flume = "0.12"
+cfg-if = "1.0"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "freebsd"))'.dependencies]
 machine-uid = "0.5.3"
@@ -238,6 +244,9 @@ netlink-packet-utils = "0.5.2"
 resolv-conf = "0.7.3"
 dbus = { version = "0.9.7", features = ["vendored"] }
 which = "7.0.3"
+
+[target.'cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))'.dependencies]
+windivert = { git = "https://github.com/EasyTier/windivert-rust.git", rev = "adcc56d1550f7b5377ec2b3429f413ee24a77375", features = ["static"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52.0", features = [

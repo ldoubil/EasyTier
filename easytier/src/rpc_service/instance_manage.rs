@@ -7,16 +7,18 @@ use crate::{
         api::{config::GetConfigRequest, manage::*},
         rpc_types::{self, controller::BaseController},
     },
+    web_client::WebClientHooks,
 };
 
 #[derive(Clone)]
 pub struct InstanceManageRpcService {
     manager: Arc<NetworkInstanceManager>,
+    hooks: Arc<dyn WebClientHooks>,
 }
 
 impl InstanceManageRpcService {
-    pub fn new(manager: Arc<NetworkInstanceManager>) -> Self {
-        Self { manager }
+    pub fn new(manager: Arc<NetworkInstanceManager>, hooks: Arc<dyn WebClientHooks>) -> Self {
+        Self { manager, hooks }
     }
 }
 
@@ -51,7 +53,14 @@ impl WebClientService for InstanceManageRpcService {
         };
 
         let mut control = if let Some(control) = self.manager.get_instance_config_control(&id) {
-            if !req.overwrite {
+            let error_msg = self
+                .manager
+                .get_network_info(&id)
+                .await
+                .and_then(|i| i.error_msg)
+                .unwrap_or_default();
+
+            if !req.overwrite && error_msg.is_empty() {
                 return Ok(resp);
             }
             if control.is_read_only() {
@@ -96,8 +105,17 @@ impl WebClientService for InstanceManageRpcService {
             }
         }
 
+        if let Err(e) = self.hooks.pre_run_network_instance(&cfg).await {
+            return Err(anyhow::anyhow!("pre-run hook failed: {}", e).into());
+        }
+
         self.manager.run_network_instance(cfg, true, control)?;
         println!("instance {} started", id);
+
+        if let Err(e) = self.hooks.post_run_network_instance(&id).await {
+            tracing::warn!("post-run hook failed: {}", e);
+        }
+
         Ok(resp)
     }
 
@@ -173,6 +191,9 @@ impl WebClientService for InstanceManageRpcService {
         req: DeleteNetworkInstanceRequest,
     ) -> Result<DeleteNetworkInstanceResponse, rpc_types::error::Error> {
         let inst_ids: HashSet<uuid::Uuid> = req.inst_ids.into_iter().map(Into::into).collect();
+
+        let hook_ids: Vec<uuid::Uuid> = inst_ids.iter().cloned().collect();
+
         let inst_ids = self
             .manager
             .iter()
@@ -185,11 +206,16 @@ impl WebClientService for InstanceManageRpcService {
             .filter_map(|id| {
                 self.manager
                     .get_instance_config_control(id)
-                    .and_then(|control| control.path.clone())
+                    .and_then(|control| control.path)
             })
             .collect::<Vec<_>>();
         let remain_inst_ids = self.manager.delete_network_instance(inst_ids)?;
         println!("instance {:?} retained", remain_inst_ids);
+
+        if let Err(e) = self.hooks.post_remove_network_instances(&hook_ids).await {
+            tracing::warn!("post-remove hook failed: {}", e);
+        }
+
         for config_file in config_files {
             if let Err(e) = std::fs::remove_file(&config_file) {
                 tracing::warn!(
@@ -213,6 +239,21 @@ impl WebClientService for InstanceManageRpcService {
             .inst_id
             .ok_or_else(|| anyhow::anyhow!("instance id is required"))?
             .into();
+
+        let control = self
+            .manager
+            .get_instance_config_control(&inst_id)
+            .ok_or_else(|| anyhow::anyhow!("instance config control not found"))?;
+
+        if control.is_read_only() {
+            return Err(anyhow::anyhow!(
+                "Configuration for instance {} is read-only (uses environment variables) and cannot be retrieved via API. \
+                 Please access the configuration file directly on the file system.",
+                inst_id
+            )
+            .into());
+        }
+
         let config = self
             .manager
             .get_instance_service(&inst_id)

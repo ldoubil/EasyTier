@@ -21,6 +21,7 @@ use crate::common::scoped_task::ScopedTask;
 use crate::common::PeerId;
 use crate::connector::direct::DirectConnectorManager;
 use crate::connector::manual::{ConnectorManagerRpcService, ManualConnectorManager};
+use crate::connector::tcp_hole_punch::TcpHolePunchConnector;
 use crate::connector::udp_hole_punch::UdpHolePunchConnector;
 use crate::gateway::icmp_proxy::IcmpProxy;
 use crate::gateway::kcp_proxy::{KcpProxyDst, KcpProxyDstRpcService, KcpProxySrc};
@@ -73,7 +74,7 @@ impl IpProxy {
         let tcp_proxy = TcpProxy::new(peer_manager.clone(), NatDstTcpConnector {});
         let icmp_proxy = IcmpProxy::new(global_ctx.clone(), peer_manager.clone())
             .with_context(|| "create icmp proxy failed")?;
-        let udp_proxy = UdpProxy::new(global_ctx.clone(), peer_manager.clone())
+        let udp_proxy = UdpProxy::new(global_ctx.clone(), peer_manager)
             .with_context(|| "create udp proxy failed")?;
         Ok(IpProxy {
             tcp_proxy,
@@ -484,7 +485,7 @@ impl InstanceConfigPatcher {
             match ConfigPatchAction::try_from(connector.action) {
                 Ok(ConfigPatchAction::Add) => {
                     tracing::info!("Connector added: {}", url);
-                    conn_manager.add_connector_by_url(url.as_str()).await?;
+                    conn_manager.add_connector_by_url(url).await?;
                 }
                 Ok(ConfigPatchAction::Remove) => {
                     tracing::info!("Connector removed: {}", url);
@@ -516,6 +517,7 @@ pub struct Instance {
     conn_manager: Arc<ManualConnectorManager>,
     direct_conn_manager: Arc<DirectConnectorManager>,
     udp_hole_puncher: Arc<Mutex<UdpHolePunchConnector>>,
+    tcp_hole_puncher: Arc<Mutex<TcpHolePunchConnector>>,
 
     ip_proxy: Option<IpProxy>,
 
@@ -551,7 +553,7 @@ impl Instance {
         let peer_manager = Arc::new(PeerManager::new(
             RouteAlgoType::Ospf,
             global_ctx.clone(),
-            peer_packet_sender.clone(),
+            peer_packet_sender,
         ));
 
         peer_manager.set_allow_loopback_tunnel(false);
@@ -571,6 +573,7 @@ impl Instance {
         direct_conn_manager.run();
 
         let udp_hole_puncher = UdpHolePunchConnector::new(peer_manager.clone());
+        let tcp_hole_puncher = TcpHolePunchConnector::new(peer_manager.clone());
 
         let peer_center = Arc::new(PeerCenterInstance::new(peer_manager.clone()));
 
@@ -594,6 +597,7 @@ impl Instance {
             conn_manager,
             direct_conn_manager: Arc::new(direct_conn_manager),
             udp_hole_puncher: Arc::new(Mutex::new(udp_hole_puncher)),
+            tcp_hole_puncher: Arc::new(Mutex::new(tcp_hole_puncher)),
 
             ip_proxy: None,
             kcp_proxy_src: None,
@@ -617,10 +621,10 @@ impl Instance {
         self.conn_manager.clone()
     }
 
-    async fn add_initial_peers(&mut self) -> Result<(), Error> {
+    async fn add_initial_peers(&self) -> Result<(), Error> {
         for peer in self.global_ctx.config.get_peers().iter() {
             self.get_conn_manager()
-                .add_connector_by_url(peer.uri.as_str())
+                .add_connector_by_url(peer.uri.clone())
                 .await?;
         }
         Ok(())
@@ -949,6 +953,7 @@ impl Instance {
         self.run_ip_proxy().await?;
 
         self.udp_hole_puncher.lock().await.run().await?;
+        self.tcp_hole_puncher.lock().await.run().await?;
 
         self.peer_center.init().await;
         let route_calc = self.peer_center.get_cost_calculator();

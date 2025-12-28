@@ -224,7 +224,7 @@ impl EasyTierLauncher {
             let notifier = data.instance_stop_notifier.clone();
             let ret = rt.block_on(Self::easytier_routine(
                 cfg,
-                stop_notifier.clone(),
+                stop_notifier,
                 api_service,
                 data,
             ));
@@ -700,6 +700,10 @@ impl NetworkConfig {
             flags.disable_p2p = disable_p2p;
         }
 
+        if let Some(p2p_only) = self.p2p_only {
+            flags.p2p_only = p2p_only;
+        }
+
         if let Some(bind_device) = self.bind_device {
             flags.bind_device = bind_device;
         }
@@ -736,6 +740,10 @@ impl NetworkConfig {
             }
         }
 
+        if let Some(disable_tcp_hole_punching) = self.disable_tcp_hole_punching {
+            flags.disable_tcp_hole_punching = disable_tcp_hole_punching;
+        }
+
         if let Some(disable_udp_hole_punching) = self.disable_udp_hole_punching {
             flags.disable_udp_hole_punching = disable_udp_hole_punching;
         }
@@ -754,6 +762,18 @@ impl NetworkConfig {
 
         if let Some(enable_private_mode) = self.enable_private_mode {
             flags.private_mode = enable_private_mode;
+        }
+
+        if let Some(encryption_algorithm) = self.encryption_algorithm.clone() {
+            flags.encryption_algorithm = encryption_algorithm;
+        }
+
+        if let Some(data_compress_algo) = self.data_compress_algo {
+            if data_compress_algo < 1 {
+                flags.data_compress_algo = 1;
+            } else {
+                flags.data_compress_algo = data_compress_algo
+            }
         }
 
         cfg.set_flags(flags);
@@ -776,7 +796,7 @@ impl NetworkConfig {
 
         let network_identity = config.get_network_identity();
         result.network_name = Some(network_identity.network_name.clone());
-        result.network_secret = network_identity.network_secret.clone();
+        result.network_secret = network_identity.network_secret;
 
         if let Some(ipv4) = config.get_ipv4() {
             result.virtual_ipv4 = Some(ipv4.address().to_string());
@@ -874,6 +894,7 @@ impl NetworkConfig {
         result.disable_quic_input = Some(flags.disable_quic_input);
         result.quic_listen_port = Some(flags.quic_listen_port as i32);
         result.disable_p2p = Some(flags.disable_p2p);
+        result.p2p_only = Some(flags.p2p_only);
         result.bind_device = Some(flags.bind_device);
         result.no_tun = Some(flags.no_tun);
         result.enable_exit_node = Some(flags.enable_exit_node);
@@ -881,19 +902,26 @@ impl NetworkConfig {
         result.multi_thread = Some(flags.multi_thread);
         result.proxy_forward_by_system = Some(flags.proxy_forward_by_system);
         result.disable_encryption = Some(!flags.enable_encryption);
+        result.disable_tcp_hole_punching = Some(flags.disable_tcp_hole_punching);
         result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
         result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
         result.enable_magic_dns = Some(flags.accept_dns);
         result.mtu = Some(flags.mtu as i32);
         result.enable_private_mode = Some(flags.private_mode);
 
-        if !flags.relay_network_whitelist.is_empty() && flags.relay_network_whitelist != "*" {
+        if flags.relay_network_whitelist == "*" {
+            result.enable_relay_network_whitelist = Some(false);
+        } else {
             result.enable_relay_network_whitelist = Some(true);
-            result.relay_network_whitelist = flags
-                .relay_network_whitelist
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
+            if flags.relay_network_whitelist.is_empty() {
+                result.relay_network_whitelist = vec![];
+            } else {
+                result.relay_network_whitelist = flags
+                    .relay_network_whitelist
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
+            }
         }
 
         Ok(result)
@@ -1109,6 +1137,7 @@ mod tests {
                 flags.enable_quic_proxy = rng.gen_bool(0.5);
                 flags.disable_quic_input = rng.gen_bool(0.3);
                 flags.disable_p2p = rng.gen_bool(0.2);
+                flags.p2p_only = rng.gen_bool(0.2);
                 flags.bind_device = rng.gen_bool(0.3);
                 flags.no_tun = rng.gen_bool(0.1);
                 flags.enable_exit_node = rng.gen_bool(0.4);
@@ -1116,6 +1145,7 @@ mod tests {
                 flags.multi_thread = rng.gen_bool(0.7);
                 flags.proxy_forward_by_system = rng.gen_bool(0.3);
                 flags.enable_encryption = rng.gen_bool(0.8);
+                flags.disable_tcp_hole_punching = rng.gen_bool(0.2);
                 flags.disable_udp_hole_punching = rng.gen_bool(0.2);
                 flags.accept_dns = rng.gen_bool(0.6);
                 flags.mtu = rng.gen_range(1200..1500);

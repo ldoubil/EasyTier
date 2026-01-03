@@ -1481,9 +1481,23 @@ pub async fn relay_bps_limit_test(#[values(100, 200, 400, 800)] bps_limit: u64) 
     drop_insts(insts).await;
 }
 
+#[rstest::rstest]
+#[serial_test::serial]
 #[tokio::test]
-async fn avoid_tunnel_loop_back_to_virtual_network() {
-    let insts = init_three_node("udp").await;
+async fn avoid_tunnel_loop_back_to_virtual_network(#[values(true, false)] no_tun: bool) {
+    let insts = init_three_node_ex(
+        "udp",
+        |cfg| {
+            if matches!(cfg.get_inst_name().as_str(), "inst2" | "inst3") {
+                let mut flags = cfg.get_flags();
+                flags.no_tun = no_tun;
+                cfg.set_flags(flags);
+            }
+            cfg
+        },
+        false,
+    )
+    .await;
 
     let tcp_connector = TcpTunnelConnector::new("tcp://10.144.144.2:11010".parse().unwrap());
     insts[0]
@@ -2468,12 +2482,21 @@ pub async fn acl_group_self_test(
 #[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial]
-pub async fn whitelist_test(#[values("tcp", "udp")] protocol: &str) {
+pub async fn whitelist_test(
+    #[values("tcp", "udp")] protocol: &str,
+    #[values(true, false)] test_outbound_allow_list: bool,
+) {
     let port = 44553;
+    let acl_configured_inst = if test_outbound_allow_list {
+        "inst1"
+    } else {
+        "inst3"
+    };
     let insts = init_three_node_ex(
         protocol,
         move |cfg| {
-            if cfg.get_inst_name() == "inst3" {
+            let port = if test_outbound_allow_list { 0 } else { port };
+            if cfg.get_inst_name() == acl_configured_inst {
                 if protocol == "tcp" {
                     cfg.set_tcp_whitelist(vec![format!("{}", port)]);
                 } else if protocol == "udp" {
@@ -2534,6 +2557,10 @@ pub async fn whitelist_test(#[values("tcp", "udp")] protocol: &str) {
         )
         .await
         .unwrap_or_else(|_| panic!("{} should be allowed", p));
+    }
+
+    if test_outbound_allow_list {
+        return;
     }
 
     // test other port

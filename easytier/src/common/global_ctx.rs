@@ -55,6 +55,8 @@ pub enum GlobalCtxEvent {
     PortForwardAdded(PortForwardConfigPb),
 
     ConfigPatched(InstanceConfigPatch),
+
+    ProxyCidrsUpdated(Vec<cidr::Ipv4Cidr>, Vec<cidr::Ipv4Cidr>), // (added, removed)
 }
 
 pub type EventBus = tokio::sync::broadcast::Sender<GlobalCtxEvent>;
@@ -299,6 +301,18 @@ impl GlobalCtx {
         if !l.contains(&url) {
             l.push(url);
         }
+    }
+
+    pub fn is_port_in_running_listeners(&self, port: u16, is_udp: bool) -> bool {
+        let check_proto = |listener_proto: &str| {
+            let listener_is_udp = matches!(listener_proto, "udp" | "wg");
+            listener_is_udp == is_udp
+        };
+        self.running_listeners
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|x| x.port() == Some(port) && check_proto(x.scheme()))
     }
 
     pub fn get_vpn_portal_cidr(&self) -> Option<cidr::Ipv4Cidr> {

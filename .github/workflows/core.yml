@@ -30,7 +30,7 @@ jobs:
           concurrent_skipping: 'same_content_newer'
           skip_after_successful_duplicate: 'true'
           cancel_others: 'true'
-          paths: '["Cargo.toml", "Cargo.lock", "easytier/**", ".github/workflows/core.yml", ".github/workflows/install_rust.sh"]'
+          paths: '["Cargo.toml", "Cargo.lock", "easytier/**", ".github/workflows/core.yml", ".github/workflows/install_rust.sh", "easytier-web/**"]'
   build_web:
     runs-on: ubuntu-latest
     needs: pre_job
@@ -238,6 +238,16 @@ jobs:
             cargo build --release --verbose --target $TARGET --package=easytier-web --features=embed
             mv ./target/$TARGET/release/easytier-web ./target/$TARGET/release/easytier-web-embed
             cargo build --release --verbose --target $TARGET --features=mimalloc
+
+            mkdir -p built-bins/$TARGET/release/
+            mv ./target/$TARGET/release/easytier-web-embed ./built-bins/$TARGET/release/easytier-web-embed
+            mv ./target/$TARGET/release/easytier-web ./built-bins/$TARGET/release/easytier-web
+            mv ./target/$TARGET/release/easytier-core ./built-bins/$TARGET/release/easytier-core
+            mv ./target/$TARGET/release/easytier-cli ./built-bins/$TARGET/release/easytier-cli
+
+            # remove dirs to avoid copy many files back
+            rm -rf ./target ~/.cargo
+            mv ./built-bins ./target
 
       - name: Compress
         run: |

@@ -7,6 +7,8 @@ use http_connector::HttpTunnelConnector;
 
 #[cfg(feature = "quic")]
 use crate::tunnel::quic::QUICTunnelConnector;
+#[cfg(unix)]
+use crate::tunnel::unix::UnixSocketTunnelConnector;
 #[cfg(feature = "wireguard")]
 use crate::tunnel::wireguard::{WgConfig, WgTunnelConnector};
 use crate::{
@@ -31,7 +33,11 @@ async fn set_bind_addr_for_peer_connector(
     is_ipv4: bool,
     ip_collector: &Arc<IPCollector>,
 ) {
-    if cfg!(any(target_os = "android", target_env = "ohos")) {
+    if cfg!(any(
+        target_os = "android",
+        target_os = "ios",
+        target_env = "ohos"
+    )) {
         return;
     }
 
@@ -171,6 +177,11 @@ pub async fn create_connector_by_url(
                 )
                 .await;
             }
+            Box::new(connector)
+        }
+        #[cfg(unix)]
+        "unix" => {
+            let connector = UnixSocketTunnelConnector::new(url);
             Box::new(connector)
         }
         _ => {

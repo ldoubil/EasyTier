@@ -1,6 +1,7 @@
 mod graph_algo;
 
 pub mod acl_filter;
+pub mod astral_app_rpc;
 pub mod credential_manager;
 pub mod peer;
 pub mod peer_conn;

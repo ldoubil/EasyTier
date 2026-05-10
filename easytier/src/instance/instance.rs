@@ -1116,6 +1116,11 @@ impl Instance {
             )
             .await?;
 
+        // Application-level peer RPC ("envelope" service): always-on so
+        // downstream crates (e.g. astral_rust_core) can address peers by
+        // (instance_id, dst_peer_id) without touching network internals.
+        crate::peers::astral_app_rpc::install(self.id, &self.peer_manager);
+
         Ok(())
     }
 
@@ -1593,9 +1598,19 @@ impl Instance {
     }
 
     pub async fn clear_resources(&mut self) {
+        crate::peers::astral_app_rpc::uninstall(&self.id);
         self.peer_manager.clear_resources().await;
         #[cfg(feature = "tun")]
         let _ = self.nic_ctx.lock().await.take();
+    }
+
+    /// Convenience accessor for the always-on application-level peer RPC
+    /// service. Returns `None` if this instance hasn't completed `run()` yet
+    /// or has already torn down via `clear_resources`.
+    pub fn get_app_rpc_service(
+        &self,
+    ) -> Option<Arc<crate::peers::astral_app_rpc::AstralAppRpcService>> {
+        crate::peers::astral_app_rpc::get_service(&self.id)
     }
 }
 

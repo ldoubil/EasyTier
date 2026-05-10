@@ -3,6 +3,7 @@ pub mod rpc_types;
 
 pub mod acl;
 pub mod api;
+pub mod astral_rpc;
 pub mod common;
 pub mod error;
 #[cfg(feature = "magic-dns")]

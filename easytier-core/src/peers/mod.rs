@@ -1,5 +1,6 @@
 pub(crate) mod acl;
 pub(crate) mod admission;
+pub mod astral_app_rpc;
 pub(crate) mod attached;
 pub(crate) mod conn;
 pub mod context;

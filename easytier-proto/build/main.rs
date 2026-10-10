@@ -100,6 +100,7 @@ fn main() -> anyhow::Result<()> {
         "proto/web.proto",
         "proto/magic_dns.proto",
         "proto/acl.proto",
+        "proto/astral_rpc.proto",
     ];
 
     for proto_file in proto_files.iter().chain(proto_files_reflect.iter()) {

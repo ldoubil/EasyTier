@@ -1,0 +1,77 @@
+// Astral application-level peer RPC service.
+//
+// This service is intentionally minimal and stable: business logic on top of
+// EasyTier's peer-to-peer transport routes itself via the `channel` field and
+// its self-describing `payload` bytes (json / protobuf / msgpack / ...). The
+// RPC surface here SHOULD NOT grow with business features; add new business
+// flows by introducing new `channel` strings, not new RPC methods.
+
+syntax = "proto3";
+
+package astral_rpc;
+
+// Request-response style call. Use this when the caller expects a payload
+// back (sync RPC, queries, application-level acknowledgements, etc.).
+message AppCallRequest {
+  // Sender's PeerId. Filled automatically by the AstralAppRpcService send
+  // helper. EasyTier's peer transport authenticates the sending node, so this
+  // can be trusted at network-layer granularity (mainly used for routing/
+  // logging on the receiver side).
+  uint32 from_peer_id = 1;
+
+  // Free-form application-level routing key (e.g. "chat.send", "file.meta").
+  string channel = 2;
+
+  // Optional caller-supplied id for business-level correlation.
+  uint64 request_id = 3;
+
+  // Application-defined payload. Encoding is chosen by the application
+  // (protobuf / json / msgpack / raw bytes).
+  bytes payload = 4;
+
+  // Reserved for future flags (compression hints, priority, ...). Keep 0.
+  uint32 flags = 5;
+}
+
+message AppCallResponse {
+  // 0 == ok. Negative values are reserved for transport-level failures
+  // (no subscriber on receiver, reply timeout, etc.). Positive values are
+  // free for application-defined statuses.
+  int32 status = 1;
+
+  // Human-readable error description when status != 0.
+  string error_msg = 2;
+
+  // Application-defined payload returned to the caller.
+  bytes payload = 3;
+}
+
+// Fire-and-(rpc-)forget notification. There is no business response, but the
+// underlying RPC framework still gives the caller an ack/timeout signal.
+message AppNotifyRequest {
+  uint32 from_peer_id = 1;
+  string channel = 2;
+  bytes payload = 3;
+}
+
+message AppNotifyResponse {}
+
+// Ping for peer-to-peer reachability and RTT measurements. Cheap, never
+// dispatched to the application layer; handled inside the service impl.
+message AppPingRequest {
+  uint32 from_peer_id = 1;
+  uint64 nonce = 2;
+  uint64 sender_unix_ms = 3;
+}
+
+message AppPingResponse {
+  uint64 nonce = 1;
+  uint64 sender_unix_ms = 2;
+  uint64 receiver_unix_ms = 3;
+}
+
+service AstralAppRpc {
+  rpc Call(AppCallRequest) returns (AppCallResponse);
+  rpc Notify(AppNotifyRequest) returns (AppNotifyResponse);
+  rpc Ping(AppPingRequest) returns (AppPingResponse);
+}

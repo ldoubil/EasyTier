@@ -51,6 +51,7 @@ pin-project-lite.workspace = true
 prefix-trie = { version = "0.10.1", features = ["cidr"] }
 prost.workspace = true
 prost-types.workspace = true
+once_cell.workspace = true
 rand.workspace = true
 quanta.workspace = true
 ring = { version = "0.17", optional = true }

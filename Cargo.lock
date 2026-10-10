@@ -2669,6 +2669,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "idna",
+ "once_cell",
  "openssl",
  "optionize",
  "ordered_hash_map",

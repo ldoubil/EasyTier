@@ -158,6 +158,12 @@ where
             self.socks5_adapter.start().await?;
             self.port_forward_adapter.start().await?;
         }
+
+        // Application-level peer RPC ("envelope" service): always-on so
+        // downstream crates (e.g. astral_rust_core) can address peers by
+        // (instance_id, dst_peer_id) without touching network internals.
+        crate::peers::astral_app_rpc::install(self.instance_id(), &self.peer_manager);
+
         Ok(())
     }
 
@@ -212,6 +218,7 @@ where
         // Host packet tasks can still call the packet plane, so stop them
         // before clearing PeerManager resources.
         self.instance_runtime.shutdown().await;
+        crate::peers::astral_app_rpc::uninstall(&self.instance_id());
         self.peer_manager.clear_resources().await;
         self.packet_egress.stop().await;
     }

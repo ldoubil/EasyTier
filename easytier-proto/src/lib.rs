@@ -6,6 +6,8 @@ pub mod acl;
 #[cfg(feature = "api")]
 pub mod api;
 #[cfg(feature = "core")]
+pub mod astral_rpc;
+#[cfg(feature = "core")]
 pub mod common;
 #[cfg(feature = "core")]
 pub mod core_config;

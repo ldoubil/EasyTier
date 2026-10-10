@@ -8,6 +8,7 @@ use strum::VariantArray as _;
 use tokio::io::AsyncReadExt as _;
 
 use easytier_core::config::MappedListenerPolicy;
+pub use easytier_core::config::normalize_secure_mode_config;
 #[cfg(feature = "management")]
 pub use easytier_core::config::api_input::{
     NetworkConfig, NetworkConfigExt, NetworkingMethod, add_proxy_network_to_config,

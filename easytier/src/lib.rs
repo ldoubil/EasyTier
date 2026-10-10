@@ -14,6 +14,9 @@ pub mod common;
 pub mod core;
 #[cfg(feature = "upnp")]
 pub(crate) mod igd_next;
+/// Re-export of the core peer subsystem, including the always-on application
+/// level peer RPC (`peers::astral_app_rpc`) used by downstream crates.
+pub use easytier_core::peers;
 pub mod proto;
 #[cfg(feature = "management-rpc")]
 pub mod rpc_service;

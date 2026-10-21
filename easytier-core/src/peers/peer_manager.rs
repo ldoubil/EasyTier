@@ -2767,6 +2767,7 @@ impl PeerOutboundPacketRouter {
         );
 
         msg.fill_peer_manager_hdr(self.my_peer_id, 0, PacketType::Data as u8);
+        let filters_registered = !self.nic_packet_process_pipeline.load().is_empty();
         if !self.run_nic_packet_process_pipeline(&mut msg).await {
             return Ok(());
         }
@@ -2775,7 +2776,8 @@ impl PeerOutboundPacketRouter {
         // virtual peer address to a fake address on the local subnet). Routing
         // must use the rewritten destination, otherwise the packet is looked up
         // by the pre-filter address and dropped as unreachable.
-        if let Ok(meta) = crate::instance::packet_io::parse_ip_packet(msg.payload())
+        if filters_registered
+            && let Ok(meta) = crate::instance::packet_io::parse_ip_packet(msg.payload())
             && meta.destination != ip_addr
         {
             tracing::trace!(

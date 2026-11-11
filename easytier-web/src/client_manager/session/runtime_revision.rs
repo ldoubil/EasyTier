@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Context as _;
 use easytier::proto::{
     api::manage::{
         DeleteNetworkInstanceRequest, DeleteNetworkInstanceResponse,
@@ -13,8 +14,8 @@ use easytier_core::management::remote_client::{ListNetworkProps, Storage as _};
 use tokio::sync::{RwLock, broadcast};
 
 use super::{
-    ManagedConfigReconcileHint, SessionConfigClient, SessionData, SessionRpcClient,
-    SessionRpcService,
+    ManagedConfigReconcileHint, SessionConfigClient, SessionData, SessionPeerClient,
+    SessionRpcClient, SessionRpcService,
 };
 use crate::client_manager::{
     managed_config::{self, PersistedConfigSource},
@@ -23,11 +24,12 @@ use crate::client_manager::{
 };
 
 async fn recv_latest_heartbeat(
-    heartbeat_waiter: &mut broadcast::Receiver<HeartbeatRequest>,
+    session_data: &std::sync::Weak<RwLock<SessionData>>,
+    heartbeat_waiter: &mut broadcast::Receiver<()>,
 ) -> Option<HeartbeatRequest> {
-    let mut req = loop {
+    loop {
         match heartbeat_waiter.recv().await {
-            Ok(req) => break req,
+            Ok(()) => break,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     skipped,
@@ -39,33 +41,47 @@ async fn recv_latest_heartbeat(
                 return None;
             }
         }
-    };
+    }
 
     // Drop any heartbeat backlog accumulated while the previous reconcile
     // round was doing DB/RPC IO. The newest heartbeat has the freshest
     // runtime instance list, which is all this task needs.
     loop {
         match heartbeat_waiter.try_recv() {
-            Ok(next_req) => req = next_req,
+            Ok(()) => {}
             Err(broadcast::error::TryRecvError::Empty) => break,
             Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
             Err(broadcast::error::TryRecvError::Closed) => return None,
         }
     }
 
-    Some(req)
+    // Notifications can be delayed by validation or publication IO. Read the
+    // current heartbeat instead of replaying the snapshot taken before that IO.
+    session_data.upgrade()?.read().await.req()
+}
+
+struct SessionClients {
+    rpc: SessionRpcClient,
+    config: SessionConfigClient,
+    peer: SessionPeerClient,
 }
 
 pub(super) async fn reconcile_network_configs_on_heartbeat(
     session_data: std::sync::Weak<RwLock<SessionData>>,
-    mut heartbeat_waiter: broadcast::Receiver<HeartbeatRequest>,
+    mut heartbeat_waiter: broadcast::Receiver<()>,
     storage: WeakRefStorage,
-    mut rpc_client: SessionRpcClient,
-    mut config_client: SessionConfigClient,
+    rpc_client: SessionRpcClient,
+    config_client: SessionConfigClient,
+    peer_client: SessionPeerClient,
 ) {
+    let mut clients = SessionClients {
+        rpc: rpc_client,
+        config: config_client,
+        peer: peer_client,
+    };
     let mut cache = ReconcileCache::default();
     loop {
-        let Some(req) = recv_latest_heartbeat(&mut heartbeat_waiter).await else {
+        let Some(req) = recv_latest_heartbeat(&session_data, &mut heartbeat_waiter).await else {
             return;
         };
         let Some(storage) = storage.upgrade() else {
@@ -74,14 +90,14 @@ pub(super) async fn reconcile_network_configs_on_heartbeat(
         };
 
         let mut round =
-            match prepare_reconcile_round(&session_data, &storage, &mut rpc_client, req).await {
+            match prepare_reconcile_round(&session_data, &storage, &mut clients.rpc, req).await {
                 RoundStatus::Ready(round) => round,
                 RoundStatus::Skip => continue,
                 RoundStatus::Stop => return,
             };
         cache.reset_if_runtime_config_cache_epoch_changed(round.runtime_config_cache_epoch);
         let running_metas =
-            match sync_running_sources_for_round(&mut rpc_client, &storage, &mut round).await {
+            match sync_running_sources_for_round(&mut clients.rpc, &storage, &mut round).await {
                 RoundStatus::Ready(running_metas) => running_metas,
                 RoundStatus::Skip => continue,
                 RoundStatus::Stop => return,
@@ -105,7 +121,7 @@ pub(super) async fn reconcile_network_configs_on_heartbeat(
                 match cleanup_stale_web_source_instances(
                     &context,
                     &storage,
-                    &mut rpc_client,
+                    &mut clients.rpc,
                     running_metas.as_deref(),
                     &desired_web_inst_ids,
                     &mut cache,
@@ -121,7 +137,7 @@ pub(super) async fn reconcile_network_configs_on_heartbeat(
             ReconcileScope::Patch { .. } => {
                 match cleanup_patch_deleted_instances(
                     &session_data,
-                    &mut rpc_client,
+                    &mut clients.rpc,
                     &round,
                     running_metas.as_deref(),
                     &round.delete_instance_ids,
@@ -140,8 +156,7 @@ pub(super) async fn reconcile_network_configs_on_heartbeat(
         outcome.merge(
             reconcile_desired_runtime_configs(
                 &context,
-                &mut rpc_client,
-                &mut config_client,
+                &mut clients,
                 &mut cache,
                 &mut mutation_fence,
             )
@@ -227,6 +242,8 @@ impl SessionRuntimeConfigCache {
         &self,
         inst_id: &str,
         desired_config: NetworkConfig,
+        support_manual_routes_patch: bool,
+        support_dns_config_patch: bool,
     ) -> anyhow::Result<Option<runtime_reconcile::RuntimeReconcileAction>> {
         let Some(observed_config) = self.entries.get(inst_id) else {
             return Ok(None);
@@ -235,6 +252,8 @@ impl SessionRuntimeConfigCache {
         runtime_reconcile::prepare_web_source_runtime_reconcile_from_current(
             observed_config,
             desired_config,
+            support_manual_routes_patch,
+            support_dns_config_patch,
         )
         .map(Some)
     }
@@ -390,6 +409,15 @@ async fn prepare_reconcile_round(
             RoundStatus::Skip => return RoundStatus::Skip,
             RoundStatus::Stop => return RoundStatus::Stop,
         };
+    {
+        let Some(data) = session_data.upgrade() else {
+            return RoundStatus::Stop;
+        };
+        let data = data.read().await;
+        if !data.runtime_config_is_ready(target_config_revision.as_deref()) {
+            return RoundStatus::Skip;
+        }
+    }
     let should_apply_runtime_revision =
         target_config_revision.is_some() && target_config_revision != applied_config_revision;
     let mut scope = if should_apply_runtime_revision {
@@ -872,7 +900,9 @@ async fn begin_managed_runtime_mutation(
         return false;
     };
     let data = data.write().await;
-    if !SessionRpcService::runtime_heartbeat_is_current_locked(&data, &round.req) {
+    if !SessionRpcService::runtime_heartbeat_is_current_locked(&data, &round.req)
+        || !data.runtime_config_is_ready(round.target_config_revision.as_deref())
+    {
         return false;
     }
     let managed_runtime = data.managed_runtime.clone();
@@ -920,8 +950,7 @@ fn should_reconcile_running_web_config(
 
 async fn reconcile_desired_runtime_configs(
     context: &ReconcileRoundContext<'_>,
-    rpc_client: &mut SessionRpcClient,
-    config_client: &mut SessionConfigClient,
+    clients: &mut SessionClients,
     cache: &mut ReconcileCache,
     mutation_fence: &mut RuntimeMutationFence,
 ) -> ReconcileOutcome {
@@ -963,8 +992,7 @@ async fn reconcile_desired_runtime_configs(
         let action_result = if should_reconcile_running_web_config {
             reconcile_running_web_config(
                 context,
-                rpc_client,
-                config_client,
+                clients,
                 config,
                 desired_config,
                 &mut cache.runtime_configs,
@@ -977,7 +1005,7 @@ async fn reconcile_desired_runtime_configs(
             }
             let action_result = run_missing_network_config(
                 session_data,
-                rpc_client,
+                &mut clients.rpc,
                 round,
                 config,
                 desired_config.clone(),
@@ -988,10 +1016,12 @@ async fn reconcile_desired_runtime_configs(
                 && source == PersistedConfigSource::Web
             {
                 if let Err(e) = remember_web_runtime_config_after_run(
-                    rpc_client,
+                    clients,
                     &config.network_instance_id,
                     &desired_config,
                     &mut cache.runtime_configs,
+                    round.req.support_manual_routes_patch,
+                    round.req.support_dns_config_patch == Some(true),
                 )
                 .await
                 {
@@ -1034,8 +1064,7 @@ async fn reconcile_desired_runtime_configs(
 
 async fn reconcile_running_web_config(
     context: &ReconcileRoundContext<'_>,
-    rpc_client: &mut SessionRpcClient,
-    config_client: &mut SessionConfigClient,
+    clients: &mut SessionClients,
     config: &crate::db::entity::user_running_network_configs::Model,
     desired_config: NetworkConfig,
     runtime_config_cache: &mut SessionRuntimeConfigCache,
@@ -1054,19 +1083,26 @@ async fn reconcile_running_web_config(
 
     let operation_started_at = std::time::Instant::now();
     let ret = async {
-        let action =
-            match runtime_config_cache.plan(&config.network_instance_id, desired_config.clone())? {
-                Some(action) => action,
-                None => {
-                    runtime_reconcile::prepare_web_source_runtime_reconcile(
-                        &mut *rpc_client,
-                        &config.network_instance_id,
-                        desired_config.clone(),
-                        true,
-                    )
-                    .await?
-                }
-            };
+        let action = match runtime_config_cache.plan(
+            &config.network_instance_id,
+            desired_config.clone(),
+            round.req.support_manual_routes_patch,
+            round.req.support_dns_config_patch == Some(true),
+        )? {
+            Some(action) => action,
+            None => {
+                runtime_reconcile::prepare_web_source_runtime_reconcile(
+                    &mut clients.config,
+                    &mut clients.peer,
+                    &config.network_instance_id,
+                    desired_config.clone(),
+                    true,
+                    round.req.support_manual_routes_patch,
+                    round.req.support_dns_config_patch == Some(true),
+                )
+                .await?
+            }
+        };
         if !SessionRpcService::runtime_heartbeat_is_current(session_data, &round.req).await {
             anyhow::bail!("webhook session is no longer current before runtime reconcile apply");
         }
@@ -1078,11 +1114,13 @@ async fn reconcile_running_web_config(
             anyhow::bail!("managed runtime mutation fence is no longer current");
         }
         let observed_config = runtime_reconcile::apply_web_source_runtime_reconcile(
-            &mut *rpc_client,
-            &mut *config_client,
+            &mut clients.rpc,
+            &mut clients.config,
+            &mut clients.peer,
             &config.network_instance_id,
             desired_config.clone(),
             action,
+            &round.req,
         )
         .await?;
         runtime_config_cache.remember(&config.network_instance_id, observed_config);
@@ -1186,17 +1224,26 @@ async fn record_direct_run_result(
 }
 
 async fn remember_web_runtime_config_after_run(
-    rpc_client: &mut SessionRpcClient,
+    clients: &mut SessionClients,
     inst_id: &str,
     desired_config: &NetworkConfig,
     runtime_config_cache: &mut SessionRuntimeConfigCache,
+    support_manual_routes_patch: bool,
+    support_dns_config_patch: bool,
 ) -> anyhow::Result<()> {
-    let observed_config = runtime_reconcile::get_runtime_config(rpc_client, inst_id).await?;
+    let observed_config = runtime_reconcile::get_runtime_config(
+        &mut clients.config,
+        &mut clients.peer,
+        inst_id,
+        support_manual_routes_patch,
+    )
+    .await?;
     remember_if_runtime_matches_desired(
         inst_id,
         desired_config,
         observed_config,
         runtime_config_cache,
+        support_dns_config_patch,
     )
 }
 
@@ -1205,17 +1252,15 @@ fn remember_if_runtime_matches_desired(
     desired_config: &NetworkConfig,
     observed_config: NetworkConfig,
     runtime_config_cache: &mut SessionRuntimeConfigCache,
+    support_dns_config_patch: bool,
 ) -> anyhow::Result<()> {
-    let action = runtime_reconcile::prepare_web_source_runtime_reconcile_from_current(
+    runtime_reconcile::ensure_runtime_config_converged(
         &observed_config,
-        desired_config.clone(),
-    )?;
-    if !matches!(
-        action,
-        runtime_reconcile::RuntimeReconcileAction::Unchanged(_)
-    ) {
-        anyhow::bail!("runtime config still differs after managed run");
-    }
+        desired_config,
+        false,
+        support_dns_config_patch,
+    )
+    .context("runtime config still differs after managed run")?;
     runtime_config_cache.remember(inst_id, observed_config);
     Ok(())
 }
@@ -1247,7 +1292,9 @@ async fn mark_config_revision_applied_if_current(
     };
     let notify = {
         let mut data = data.write().await;
-        if !SessionRpcService::runtime_heartbeat_is_current_locked(&data, &round.req) {
+        if !SessionRpcService::runtime_heartbeat_is_current_locked(&data, &round.req)
+            || !data.runtime_config_is_ready(round.target_config_revision.as_deref())
+        {
             return RoundStatus::Ready(());
         }
         record_applied_config_revision(
@@ -1300,6 +1347,335 @@ mod tests {
     use easytier::proto::api::manage::{NetworkingMethod, PortForwardConfig};
 
     use super::*;
+
+    async fn takeover_session(
+        persisted_revision: Option<&str>,
+    ) -> (
+        crate::client_manager::storage::Storage,
+        std::sync::Arc<RwLock<SessionData>>,
+        ReconcileRound,
+    ) {
+        use super::super::{SessionAuthState, webhook_validation};
+        use crate::client_manager::storage::{Storage, StorageToken};
+
+        let storage = Storage::new(crate::db::Db::memory_db().await);
+        let user_id = storage.db().auto_create_user("token").await.unwrap().id;
+        let machine_id = uuid::Uuid::new_v4();
+        if let Some(revision) = persisted_revision {
+            storage
+                .db()
+                .set_managed_config_revision((user_id, machine_id), revision)
+                .await
+                .unwrap();
+        }
+        let req = HeartbeatRequest {
+            user_token: "token".to_owned(),
+            machine_id: Some(machine_id.into()),
+            running_network_instances: vec![uuid::Uuid::new_v4().into()],
+            ..Default::default()
+        };
+        let client_url = "tcp://127.0.0.1:1001".parse().unwrap();
+        let webhook = std::sync::Arc::new(crate::webhook::WebhookConfig::new(
+            Some("http://127.0.0.1:1".to_owned()),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let mut data = SessionData::new(
+            storage.weak_ref(),
+            client_url,
+            None,
+            std::sync::Arc::new(crate::FeatureFlags::default()),
+            webhook.clone(),
+        );
+        data.req = Some(req.clone());
+        data.auth_state = SessionAuthState::Authorized;
+        data.binding_version = Some(1);
+        data.webhook_connected_binding_version = Some(1);
+        data.storage_token = Some(StorageToken {
+            token: req.user_token.clone(),
+            client_url: data.client_url.clone(),
+            machine_id,
+            user_id,
+        });
+        data.managed_runtime = storage.bind_managed_runtime_state(user_id, machine_id, None, 0);
+        data.managed_runtime().applied_config_revision = persisted_revision.map(str::to_owned);
+        let session_data = std::sync::Arc::new(RwLock::new(data));
+        let client_url = session_data.read().await.client_url.clone();
+        webhook_validation::apply_success(
+            &std::sync::Arc::downgrade(&session_data),
+            webhook_validation::WebhookValidationInput {
+                storage: storage.clone(),
+                webhook_config: webhook,
+                client_url,
+                applied_config_revision: persisted_revision.map(str::to_owned),
+                applied_config_revision_known: false,
+                failed_instance_ids: Vec::new(),
+                req: req.clone(),
+                machine_id,
+            },
+            webhook_validation::WebhookHeartbeatValidation {
+                config_revision: "current".to_owned(),
+                binding_version: 1,
+            },
+            user_id,
+            0,
+        )
+        .await;
+        let mut round = round_with_revision_state(persisted_revision, false);
+        round.req = req;
+        round.machine_id = machine_id;
+        round.user_id = user_id;
+        round.runtime_config_epoch = session_data
+            .read()
+            .await
+            .managed_runtime()
+            .runtime_config_epoch;
+        (storage, session_data, round)
+    }
+
+    #[tokio::test]
+    async fn dns_capability_change_invalidates_applied_revision_and_stale_round() {
+        let (storage, data, mut round) = takeover_session(Some("current")).await;
+        round.should_apply_runtime_revision = true;
+        let weak = std::sync::Arc::downgrade(&data);
+        let initial_epoch = round.runtime_config_epoch;
+        for (index, supported) in [true, false].into_iter().enumerate() {
+            let mut current = round.req.clone();
+            current.support_dns_config_patch = Some(supported);
+            {
+                let mut data = data.write().await;
+                SessionRpcService::store_latest_heartbeat_req(&mut data, current.clone());
+                let runtime = data.managed_runtime();
+                assert!(runtime.applied_config_revision.is_none());
+                assert!(runtime.known_runtime_base_revision.is_none());
+                assert!(matches!(
+                    runtime.pending_managed_config_reconcile,
+                    Some(ManagedConfigReconcileHint::Full)
+                ));
+                assert_eq!(
+                    runtime.runtime_config_epoch,
+                    initial_epoch + index as u64 + 1
+                );
+                assert_eq!(
+                    runtime.runtime_config_cache_epoch,
+                    round.runtime_config_cache_epoch + index as u64 + 1
+                );
+            }
+            assert!(!SessionRpcService::runtime_heartbeat_is_current(&weak, &round.req).await);
+            assert!(SessionRpcService::runtime_heartbeat_is_current(&weak, &current).await);
+            mark_config_revision_applied_if_current(
+                &weak,
+                &storage.weak_ref().upgrade().unwrap(),
+                &round,
+                &ReconcileOutcome::default(),
+                &RuntimeMutationFence::default(),
+            )
+            .await;
+            assert!(
+                data.read()
+                    .await
+                    .managed_runtime()
+                    .applied_config_revision
+                    .is_none()
+            );
+            round.req = current;
+        }
+    }
+
+    #[tokio::test]
+    async fn takeover_skips_missing_and_outdated_receiver_config() {
+        for revision in [None, Some("outdated")] {
+            let (storage, data, round) = takeover_session(revision).await;
+            let rpc = easytier::proto::rpc::bidirect::BidirectRpcManager::new();
+            let mut client: SessionRpcClient = rpc.rpc_client().scoped_client::<
+                easytier::proto::api::manage::WebClientServiceClientFactory<BaseController>,
+            >(1, 1, String::new());
+
+            assert!(matches!(
+                prepare_reconcile_round(
+                    &std::sync::Arc::downgrade(&data),
+                    &storage.weak_ref().upgrade().unwrap(),
+                    &mut client,
+                    round.req,
+                )
+                .await,
+                RoundStatus::Skip
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn takeover_fences_mutations_and_applied_reports_from_unready_rounds() {
+        for revision in [None, Some("outdated")] {
+            let (storage, data, mut round) = takeover_session(revision).await;
+            let weak = std::sync::Arc::downgrade(&data);
+            let mut mutation = RuntimeMutationFence::default();
+            assert!(!begin_managed_runtime_mutation(&weak, &round, &mut mutation).await);
+            assert!(!mutation.started);
+
+            round.should_apply_runtime_revision = true;
+            mark_config_revision_applied_if_current(
+                &weak,
+                &storage.weak_ref().upgrade().unwrap(),
+                &round,
+                &ReconcileOutcome::default(),
+                &mutation,
+            )
+            .await;
+            let data = data.read().await;
+            let runtime = data.managed_runtime();
+            assert!(!runtime.applied_config_revision_known);
+            assert_eq!(runtime.applied_config_revision.as_deref(), revision);
+        }
+    }
+
+    async fn validate_takeover_session(
+        storage: &crate::client_manager::storage::Storage,
+        data: &std::sync::Arc<RwLock<SessionData>>,
+        round: &ReconcileRound,
+        revision: &str,
+        epoch: u64,
+    ) {
+        use super::super::webhook_validation;
+
+        let (webhook_config, client_url) = {
+            let data = data.read().await;
+            (data.webhook_config.clone(), data.client_url.clone())
+        };
+        webhook_validation::apply_success(
+            &std::sync::Arc::downgrade(data),
+            webhook_validation::WebhookValidationInput {
+                storage: storage.clone(),
+                webhook_config,
+                client_url,
+                applied_config_revision: None,
+                applied_config_revision_known: false,
+                failed_instance_ids: Vec::new(),
+                req: round.req.clone(),
+                machine_id: round.machine_id,
+            },
+            webhook_validation::WebhookHeartbeatValidation {
+                config_revision: revision.to_owned(),
+                binding_version: 1,
+            },
+            round.user_id,
+            epoch,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn takeover_new_publication_fences_late_validation_and_publication_callbacks() {
+        use super::super::{HeartbeatPolicy, Session};
+        use std::sync::Arc;
+
+        let (storage, data, round) = takeover_session(Some("current")).await;
+        let mut session = Session::new(
+            storage.weak_ref(),
+            "tcp://127.0.0.1:1001".parse().unwrap(),
+            None,
+            HeartbeatPolicy::default(),
+            Arc::new(crate::FeatureFlags::default()),
+            data.read().await.webhook_config.clone(),
+            0,
+        );
+        session.data = data.clone();
+        let old_epoch = data.read().await.webhook_validation_change_epoch;
+        storage
+            .db()
+            .set_managed_config_revision((round.user_id, round.machine_id), "newer")
+            .await
+            .unwrap();
+        storage.record_full_managed_config_change(round.user_id, round.machine_id, Some("newer"));
+        session
+            .notify_managed_runtime_state_changed(round.user_id, round.machine_id, Some("newer"))
+            .await;
+
+        validate_takeover_session(&storage, &data, &round, "current", old_epoch).await;
+        session
+            .notify_managed_runtime_state_changed(round.user_id, round.machine_id, Some("current"))
+            .await;
+        let current_epoch = {
+            let data = data.read().await;
+            assert_eq!(data.webhook_config_revision.as_deref(), Some("current"));
+            assert!(!data.runtime_config_is_ready(Some("newer")));
+            assert!(data.webhook_validation_dirty);
+            data.webhook_validation_change_epoch
+        };
+        assert!(
+            !begin_managed_runtime_mutation(
+                &Arc::downgrade(&data),
+                &round,
+                &mut RuntimeMutationFence::default()
+            )
+            .await
+        );
+
+        validate_takeover_session(&storage, &data, &round, "newer", current_epoch).await;
+        assert!(data.read().await.runtime_config_is_ready(Some("newer")));
+
+        // A newer Console revision may be observed after a publication commits
+        // but before its callback runs. SQLite still containing that publication
+        // does not allow the late callback to replace the newer authority.
+        validate_takeover_session(&storage, &data, &round, "newest", current_epoch).await;
+        session
+            .notify_managed_runtime_state_changed(round.user_id, round.machine_id, Some("newer"))
+            .await;
+        let data = data.read().await;
+        assert_eq!(data.webhook_config_revision.as_deref(), Some("newest"));
+        assert!(!data.runtime_config_is_ready(Some("newer")));
+        assert!(data.webhook_validation_dirty);
+    }
+
+    #[tokio::test]
+    async fn unchanged_validation_does_not_replay_an_old_heartbeat() {
+        let (storage, data, round) = takeover_session(Some("current")).await;
+        let mut notifications = data.read().await.heartbeat_waiter();
+        let epoch = data.read().await.webhook_validation_change_epoch;
+        validate_takeover_session(&storage, &data, &round, "current", epoch).await;
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let newest_instance = uuid::Uuid::new_v4();
+        {
+            let mut data = data.write().await;
+            data.notifier.send(()).unwrap();
+            data.req.as_mut().unwrap().running_network_instances = vec![newest_instance.into()];
+        }
+        let req = recv_latest_heartbeat(&std::sync::Arc::downgrade(&data), &mut notifications)
+            .await
+            .unwrap();
+        assert_eq!(req.running_network_instances, vec![newest_instance.into()]);
+    }
+
+    #[tokio::test]
+    async fn authoritative_empty_config_remains_ready_but_missing_revision_does_not() {
+        let (storage, data, round) = takeover_session(Some("current")).await;
+        let mut mutation = RuntimeMutationFence::default();
+        assert!(round.local_configs.is_empty());
+        assert!(
+            begin_managed_runtime_mutation(
+                &std::sync::Arc::downgrade(&data),
+                &round,
+                &mut mutation
+            )
+            .await
+        );
+        let epoch = data.read().await.webhook_validation_change_epoch;
+        validate_takeover_session(&storage, &data, &round, "", epoch).await;
+        let mut data = data.write().await;
+        assert!(!data.runtime_config_is_ready(None));
+        assert!(!data.runtime_config_is_ready(Some("current")));
+        data.binding_version = Some(0);
+        assert!(
+            data.runtime_config_is_ready(None),
+            "legacy webhook without managed fields"
+        );
+    }
 
     fn config_with_port_forwards(port_forwards: Vec<PortForwardConfig>) -> NetworkConfig {
         NetworkConfig {
@@ -1839,10 +2215,86 @@ mod tests {
     fn session_runtime_config_cache_misses_unknown_instance() {
         let cache = SessionRuntimeConfigCache::default();
         let action = cache
-            .plan("missing", config_with_port_forwards(Vec::new()))
+            .plan(
+                "missing",
+                config_with_port_forwards(Vec::new()),
+                false,
+                true,
+            )
             .expect("prepare action");
 
         assert!(action.is_none());
+    }
+
+    #[test]
+    fn dns_cache_uses_current_capability_without_losing_pending_config() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = current.clone();
+        desired.dns = Some(easytier::proto::core_config::DnsConfigRaw {
+            domain: Some("pending.test".to_owned()),
+            ..Default::default()
+        });
+        let mut cache = SessionRuntimeConfigCache::default();
+        remember_if_runtime_matches_desired("managed", &desired, current, &mut cache, false)
+            .unwrap();
+        for supported in [false, true, false] {
+            let action = cache
+                .plan("managed", desired.clone(), true, supported)
+                .unwrap()
+                .unwrap();
+            match action {
+                runtime_reconcile::RuntimeReconcileAction::Unchanged(observed) => {
+                    assert!(!supported);
+                    assert!(observed.dns.is_none());
+                }
+                runtime_reconcile::RuntimeReconcileAction::Patch(patch) => {
+                    assert!(supported);
+                    assert_eq!(
+                        patch.dns.unwrap().domain,
+                        desired.dns.as_ref().unwrap().domain
+                    );
+                }
+                runtime_reconcile::RuntimeReconcileAction::Run { .. } => {
+                    panic!("DNS-only changes must not recreate the instance");
+                }
+            }
+        }
+        assert!(cache.entries["managed"].dns.is_none());
+    }
+
+    #[test]
+    fn session_runtime_config_cache_uses_current_heartbeat_route_support() {
+        let automatic = config_with_port_forwards(Vec::new());
+        let mut manual = automatic.clone();
+        manual.enable_manual_routes = Some(true);
+        let mut cache = SessionRuntimeConfigCache::default();
+        cache.remember("managed", automatic);
+        for supported in [false, true, false] {
+            let heartbeat = HeartbeatRequest {
+                support_manual_routes_patch: supported,
+                ..Default::default()
+            };
+            let action = cache
+                .plan(
+                    "managed",
+                    manual.clone(),
+                    heartbeat.support_manual_routes_patch,
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                matches!(action, runtime_reconcile::RuntimeReconcileAction::Patch(_)),
+                supported
+            );
+            assert_eq!(
+                matches!(
+                    action,
+                    runtime_reconcile::RuntimeReconcileAction::Run { .. }
+                ),
+                !supported
+            );
+        }
     }
 
     #[test]
@@ -1852,7 +2304,7 @@ mod tests {
 
         cache.remember("managed", config.clone());
         let action = cache
-            .plan("managed", config)
+            .plan("managed", config, false, true)
             .expect("prepare action")
             .expect("cached action");
 
@@ -1871,7 +2323,7 @@ mod tests {
 
         let unmanaged_desired = config_with_port_forwards(Vec::new());
         let action = cache
-            .plan("managed", unmanaged_desired)
+            .plan("managed", unmanaged_desired, false, true)
             .expect("prepare unmanaged hostname action")
             .expect("cached action");
         let runtime_reconcile::RuntimeReconcileAction::Unchanged(observed) = action else {
@@ -1883,7 +2335,7 @@ mod tests {
         let mut explicit_clear = config_with_port_forwards(Vec::new());
         explicit_clear.hostname = Some(String::new());
         let action = cache
-            .plan("managed", explicit_clear)
+            .plan("managed", explicit_clear, false, true)
             .expect("prepare explicit clear action")
             .expect("cached action");
         let runtime_reconcile::RuntimeReconcileAction::Patch(patch) = action else {
@@ -1902,7 +2354,7 @@ mod tests {
 
         cache.remember("managed", current);
         let action = cache
-            .plan("managed", desired)
+            .plan("managed", desired, false, true)
             .expect("prepare action")
             .expect("cached action");
 
@@ -1934,7 +2386,7 @@ mod tests {
         cache.forget("managed");
 
         let action = cache
-            .plan("managed", config)
+            .plan("managed", config, false, true)
             .expect("prepare action after remove");
         assert!(action.is_none());
     }
@@ -1944,10 +2396,10 @@ mod tests {
         let mut cache = SessionRuntimeConfigCache::default();
         let config = config_with_port_forwards(vec![port_forward(23000, 5174)]);
 
-        remember_if_runtime_matches_desired("managed", &config, config.clone(), &mut cache)
+        remember_if_runtime_matches_desired("managed", &config, config.clone(), &mut cache, true)
             .expect("remember observed config after run");
         let action = cache
-            .plan("managed", config)
+            .plan("managed", config, false, true)
             .expect("prepare action after run")
             .expect("cached action");
 
@@ -1964,15 +2416,16 @@ mod tests {
         let desired =
             config_with_port_forwards(vec![port_forward(23000, 5174), port_forward(23007, 3389)]);
 
-        let err = remember_if_runtime_matches_desired("managed", &desired, current, &mut cache)
-            .expect_err("expected stale run result not to be cached");
+        let err =
+            remember_if_runtime_matches_desired("managed", &desired, current, &mut cache, true)
+                .expect_err("expected stale run result not to be cached");
 
         assert!(
             err.to_string()
                 .contains("runtime config still differs after managed run")
         );
         let action = cache
-            .plan("managed", desired)
+            .plan("managed", desired, false, true)
             .expect("prepare action after stale run result");
         assert!(action.is_none());
     }
@@ -1984,8 +2437,9 @@ mod tests {
         let mut desired = observed.clone();
         desired.hostname = Some("device-host".to_string());
 
-        let err = remember_if_runtime_matches_desired("managed", &desired, observed, &mut cache)
-            .expect_err("missing run must not trust an omitted hostname");
+        let err =
+            remember_if_runtime_matches_desired("managed", &desired, observed, &mut cache, true)
+                .expect_err("missing run must not trust an omitted hostname");
 
         assert!(
             err.to_string()
@@ -2007,7 +2461,7 @@ mod tests {
         let mut cache = SessionRuntimeConfigCache::default();
         cache.remember("managed", observed);
         let action = cache
-            .plan("managed", desired)
+            .plan("managed", desired, false, true)
             .expect("prepare action after restore")
             .expect("cached action");
 

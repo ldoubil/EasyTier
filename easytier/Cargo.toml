@@ -113,7 +113,7 @@ rcgen = { version = "0.14.10", optional = true }
 tokio-rustls = { workspace = true, optional = true }
 
 # for tap device
-tun = { package = "tun-easytier", git = "https://github.com/EasyTier/rust-tun", features = [
+tun = { package = "tun-easytier", git = "https://github.com/EasyTier/rust-tun", rev = "43621f70b02c47086b40d34fdde997719668a6c0", features = [
     "async",
 ], optional = true }
 # for net ns
@@ -127,6 +127,7 @@ nix = { version = "0.31.3", features = [
 
 uuid = { workspace = true, features = [
     "v4",
+    "v5",
     "fast-rng",
     "macro-diagnostics",
     "serde",
@@ -257,6 +258,10 @@ windows = { workspace = true, features = [
     "Win32_System_Variant",
     "Win32_Networking_WinSock",
     "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Devices_DeviceAndDriverInstallation",
 ] }
 encoding = "0.2"
 winreg = "0.56"
@@ -328,6 +333,7 @@ default = [
     "faketcp",
     "magic-dns",
     "zstd",
+    "lzo",
     "upnp",
     "icmp-proxy",
     "management",
@@ -350,6 +356,7 @@ full = [
     "faketcp",
     "magic-dns",
     "zstd",
+    "lzo",
     "upnp",
     "icmp-proxy",
     "management",
@@ -409,6 +416,7 @@ faketcp = [
     "easytier-proto/faketcp",
 ]
 zstd = ["easytier-core/zstd", "easytier-proto/zstd"]
+lzo = ["easytier-core/lzo", "easytier-proto/lzo"]
 upnp = [
     "dep:http-body-util",
     "dep:hyper",
@@ -421,6 +429,8 @@ endpoint-discovery = [
     "dep:rustls",
     "easytier-core/endpoint-discovery",
 ]
+# Trust policy is opt-in, including when building with full features.
+system-certificates = ["endpoint-discovery", "easytier-core/system-certificates"]
 dhcp-ipv4 = ["easytier-core/dhcp-ipv4"]
 dhcp-ipv6 = ["easytier-core/dhcp-ipv6"]
 public-ipv6-provider = ["linux-netlink", "easytier-core/public-ipv6-provider"]
@@ -484,6 +494,14 @@ bin-dir = "{ name }-linux-riscv64/{ bin }{ binary-ext }"
 [package.metadata.binstall.overrides.riscv64gc-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-linux-riscv64-v{ version }.zip"
 bin-dir = "{ name }-linux-riscv64/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.powerpc64le-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-linux-ppc64le-v{ version }.zip"
+bin-dir = "{ name }-linux-ppc64le/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.powerpc64le-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-linux-ppc64le-v{ version }.zip"
+bin-dir = "{ name }-linux-ppc64le/{ bin }{ binary-ext }"
 
 [package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-windows-arm64-v{ version }.zip"

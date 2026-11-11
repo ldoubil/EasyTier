@@ -189,6 +189,79 @@ async fn lossy_udp_session_enqueue_preserves_reserved_capacity() {
     );
 }
 
+#[tokio::test]
+async fn fec_udp_frames_preserve_control_queue_capacity() {
+    use crate::packet::{FEC_REPAIR_KIND, FEC_SOURCE_KIND, PacketType, ZCPacket};
+
+    const RESERVED_CAPACITY: usize = 4;
+    let peer_addr = SocketAddr::from(([127, 0, 0, 1], 12001));
+    let conn_id = 17;
+    let key = UdpSessionKey::new(peer_addr, conn_id);
+    let mut original = ZCPacket::new_with_payload(b"fec data");
+    original.fill_peer_manager_hdr(1, 2, PacketType::Data as u8);
+    let peer = original.tunnel_payload();
+    let source = [&0u64.to_le_bytes()[..], &[FEC_SOURCE_KIND], peer].concat();
+    let repair = [
+        &0u64.to_le_bytes()[..],
+        &[FEC_REPAIR_KIND | 1, 0],
+        &0u32.to_le_bytes(),
+        &(peer.len() as u16).to_le_bytes(),
+        peer,
+    ]
+    .concat();
+
+    for frame in [source, repair] {
+        let sessions = DashMap::new();
+        let mut rings = create_udp_session_rings();
+        sessions.insert(key, udp_session_registry_entry(&rings));
+        for _ in 0..UDP_SESSION_QUEUE_CAPACITY {
+            assert!(
+                dispatch_data_packet(
+                    &sessions,
+                    peer_addr,
+                    conn_id,
+                    new_data_packet(conn_id, &frame).unwrap(),
+                    Default::default(),
+                )
+                .is_ok()
+            );
+        }
+        let mut control = ZCPacket::new_with_payload(b"ping");
+        control.fill_peer_manager_hdr(1, 2, PacketType::Ping as u8);
+        for _ in 0..RESERVED_CAPACITY {
+            assert!(
+                dispatch_data_packet(
+                    &sessions,
+                    peer_addr,
+                    conn_id,
+                    new_data_packet(conn_id, control.tunnel_payload()).unwrap(),
+                    Default::default(),
+                )
+                .is_ok()
+            );
+        }
+
+        let mut data_count = 0;
+        let mut control_count = 0;
+        for _ in 0..UDP_SESSION_QUEUE_CAPACITY {
+            let received =
+                tokio::time::timeout(Duration::from_secs(1), rings.session_recv_rx.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            if received.payload() == frame {
+                data_count += 1;
+            } else {
+                assert_eq!(received.payload(), control.tunnel_payload());
+                control_count += 1;
+            }
+        }
+        assert_eq!(data_count, UDP_SESSION_QUEUE_CAPACITY - RESERVED_CAPACITY);
+        assert_eq!(control_count, RESERVED_CAPACITY);
+    }
+}
+
 struct MockUdpSessionSocket {
     kind: UdpSessionKind,
     local_addr: SocketAddr,
@@ -1459,12 +1532,16 @@ async fn udp_session_recv_loop_error_closes_registered_sessions() {
     let socket = Arc::new(MockVirtualUdpSocket::new(local_addr, Vec::new()));
     let sessions = Arc::new(DashMap::new());
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
-    let session = create_test_easy_tier_mux_session_with_shutdown(
+    let mut session = create_test_easy_tier_mux_session_with_shutdown(
         socket.clone(),
         UdpSessionKey::new(peer_addr, conn_id),
         sessions.clone(),
         session_shutdown_rx,
     );
+    let guard = Arc::new(());
+    let weak_guard = Arc::downgrade(&guard);
+    session.keep_layer_alive(guard);
+    assert!(weak_guard.upgrade().is_some());
     let pending_connects = Arc::new(DashMap::new());
     let classified_sessions = Arc::new(DashMap::new());
     let classified_accepts = create_classified_udp_session_accepts();
@@ -1507,6 +1584,18 @@ async fn udp_session_recv_loop_error_closes_registered_sessions() {
     .await
     .unwrap();
     assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while weak_guard.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let guard = Arc::new(());
+    let weak_guard = Arc::downgrade(&guard);
+    session.keep_layer_alive(guard);
+    assert!(weak_guard.upgrade().is_none());
 }
 
 #[tokio::test]
@@ -2088,12 +2177,15 @@ impl VirtualUdpSocketFactory for MockVirtualUdpSocketFactory {
 
     async fn bind_udp(&self, options: UdpBindOptions) -> anyhow::Result<Arc<Self::Socket>> {
         self.bind_options.lock().unwrap().push(options.clone());
-        let local_addr = options.local_addr.unwrap_or_else(|| {
-            SocketAddr::from((
-                [127, 0, 0, 1],
-                self.next_port.fetch_add(1, Ordering::Relaxed),
-            ))
-        });
+        let local_addr = options
+            .local_addr
+            .filter(|addr| addr.port() != 0)
+            .unwrap_or_else(|| {
+                SocketAddr::from((
+                    [127, 0, 0, 1],
+                    self.next_port.fetch_add(1, Ordering::Relaxed),
+                ))
+            });
         let incoming = self
             .incoming
             .lock()
@@ -2146,6 +2238,59 @@ async fn udp_session_socket_listener_builds_port_bound_bind_options() {
         &listener.bound_socket().unwrap(),
         &factory.sockets()[0]
     ));
+}
+
+#[tokio::test]
+async fn classified_accept_observes_receive_failure_before_and_during_wait() {
+    for protocol in [UdpSessionProtocol::WireGuard, UdpSessionProtocol::Quic] {
+        for failed_before_accept in [false, true] {
+            let socket = Arc::new(MockVirtualUdpSocket::new(
+                "127.0.0.1:12000".parse().unwrap(),
+                Vec::new(),
+            ));
+            let layer = UdpSessionLayer::new(socket);
+            if failed_before_accept {
+                // The mux sender closes when the receive task has exited.
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), layer.accept())
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+            }
+            let mut accept = Box::pin(layer.accept_classified_session(protocol));
+            if !failed_before_accept {
+                assert!(futures::poll!(&mut accept).is_pending());
+            }
+            let error = tokio::time::timeout(Duration::from_secs(1), accept)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+}
+
+#[tokio::test]
+async fn udp_listener_releases_failed_binding_and_keeps_assigned_port() {
+    let factory = Arc::new(MockVirtualUdpSocketFactory::new(13000));
+    let mut listener = UdpSessionSocketListener::new(
+        "udp://127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+        factory.clone(),
+    );
+    listener.listen().await.unwrap();
+    let bound_addr = listener.bound_socket().unwrap().local_addr().unwrap();
+    let old_socket = Arc::downgrade(&listener.bound_socket().unwrap());
+    factory.sockets.lock().unwrap().clear();
+    assert!(listener.accept().await.is_err());
+    listener.listen().await.unwrap();
+    assert!(old_socket.upgrade().is_none());
+    assert_eq!(
+        listener.bound_socket().unwrap().local_addr().unwrap(),
+        bound_addr
+    );
+    assert_eq!(factory.bind_options().len(), 2);
 }
 
 #[tokio::test]

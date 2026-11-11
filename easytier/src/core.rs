@@ -19,14 +19,17 @@ use crate::{
 };
 use anyhow::Context;
 use cidr::IpCidr;
-use clap::{Arg, ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{
+    Arg, ArgMatches, CommandFactory, FromArgMatches, Parser, builder::TypedValueParser as _,
+};
 use easytier_core::config::{DhcpConfig, EncryptionAlgorithm, normalize_secure_mode_config};
 use guarden::defer;
 use prost_types::field_descriptor_proto::Type;
 use rust_i18n::t;
 use serde_json::{Value, json};
-use std::str::{FromStr, ParseBoolError};
+use std::str::FromStr;
 use std::{
+    fmt::Write as _,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     process::ExitCode,
@@ -128,6 +131,13 @@ struct Cli {
         help = t!("core_clap.config_dir").to_string()
     )]
     config_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "ET_SHARED_RUNTIME",
+        help = t!("core_clap.shared_runtime").to_string()
+    )]
+    shared_runtime: bool,
 
     #[command(flatten)]
     network_options: NetworkOptions,
@@ -443,6 +453,9 @@ struct NetworkOptions {
         help = t!("core_clap.credential_file").to_string()
     )]
     credential_file: Option<PathBuf>,
+
+    #[arg(long, env = "ET_TLD_DNS_ZONE", hide = true)]
+    tld_dns_zone: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -503,6 +516,26 @@ struct RpcPortalOptions {
 }
 
 impl Cli {
+    fn take_runtime_thread_count(&mut self) -> u32 {
+        let count = self
+            .network_options
+            .flags
+            .multi_thread_count
+            .unwrap_or_else(|| {
+                if self.shared_runtime {
+                    std::thread::available_parallelism().map_or(1, |count| count.get() as u32)
+                } else {
+                    Flags::defaults().multi_thread_count
+                }
+            });
+        if self.shared_runtime {
+            // Process runtime options must not make instance configs read-only.
+            self.network_options.flags.multi_thread = None;
+            self.network_options.flags.multi_thread_count = None;
+        }
+        count
+    }
+
     fn gen_listeners(addr: SocketAddr) -> impl Iterator<Item = String> {
         let dynamic = addr.port() == 0;
         IpScheme::VARIANTS.iter().map(move |proto| {
@@ -915,7 +948,12 @@ impl NetworkOptions {
             cfg.set_secure_mode(Some(normalize_secure_mode_config(c)?));
         }
 
-        cfg.patch_flags(self.flags.clone());
+        let mut flags = self.flags.clone();
+        #[allow(deprecated)]
+        if flags.tld_dns_zone.is_none() {
+            flags.tld_dns_zone = self.tld_dns_zone.clone();
+        }
+        cfg.patch_flags(flags);
         #[cfg(not(feature = "tun"))]
         cfg.patch_flags(FlagsPatch {
             no_tun: Some(true),
@@ -1018,8 +1056,8 @@ fn win_service_event_loop(
 
     let normal_status = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
         wait_hint: Duration::default(),
@@ -1102,9 +1140,9 @@ fn cli_command() -> clap::Command {
         value.parse::<T>().map(|value| json!(value))
     }
 
-    fn negated(value: &str) -> Result<Value, ParseBoolError> {
-        value.parse::<bool>().map(|value| json!(!value))
-    }
+    let parser = clap::builder::BoolishValueParser::new();
+    let boolish = parser.map(|v| json!(v));
+    let negated = parser.map(|v| json!(!v));
 
     Cli::command().args(Flags::flags().iter().map(|field| {
         let name = field.name();
@@ -1115,11 +1153,11 @@ fn cli_command() -> clap::Command {
                 .short('u')
                 .num_args(0..=1)
                 .default_missing_value("true")
-                .value_parser(negated),
+                .value_parser(negated.clone()),
             "enable_ipv6" => arg(name, "disable_ipv6")
                 .num_args(0..=1)
                 .default_missing_value("true")
-                .value_parser(negated),
+                .value_parser(negated.clone()),
             // The command line names the algorithm instead of spelling the field.
             // The values are the schema's own, which the patch reads.
             "data_compress_algo" => {
@@ -1138,7 +1176,7 @@ fn cli_command() -> clap::Command {
                     Type::Bool => arg
                         .num_args(0..=1)
                         .default_missing_value("true")
-                        .value_parser(parsed::<bool>),
+                        .value_parser(boolish.clone()),
                     Type::Uint32 => arg.value_parser(parsed::<u32>),
                     Type::Uint64 => arg.value_parser(parsed::<u64>),
                     // An enum flag takes the name the schema spells, and the patch's
@@ -1207,11 +1245,18 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
     win_service_event_loop(stop_notify_recv, cli, status_handle);
 }
 
-async fn run_main(cli: Cli) -> anyhow::Result<()> {
+async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
     defer!(dump_profile(0););
-    log::init(&cli.logging_options, true)?;
+    log::init_with_default_console_targets(
+        &cli.logging_options,
+        true,
+        &["CORE", "easytier_core::instance::manager"],
+    )?;
 
-    let manager = Arc::new(native_cli_instance_manager().with_config_path(cli.config_dir.clone()));
+    let manager = Arc::new(
+        native_cli_instance_manager(cli.shared_runtime, cli.take_runtime_thread_count())?
+            .with_config_path(cli.config_dir.clone()),
+    );
 
     let _rpc_server = ApiRpcServer::new(
         cli.rpc_portal_options.rpc_portal,
@@ -1358,10 +1403,17 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     tokio::select! {
         _ = manager.wait() => {
             let infos = manager.collect_network_infos().await?;
-            if infos
-                .into_values()
-                .filter_map(|info| info.error_msg).next().is_some() {
-                return Err(anyhow::anyhow!("some instances stopped with errors"));
+            let mut errors = String::new();
+            for (instance_id, info) in infos {
+                if let Some(error) = info.error_msg {
+                    if errors.is_empty() {
+                        errors.push_str("some instances stopped with errors:");
+                    }
+                    write!(errors, "\n{instance_id}: {error}").unwrap();
+                }
+            }
+            if !errors.is_empty() {
+                return Err(anyhow::anyhow!(errors));
             }
         }
         _ = tokio::signal::ctrl_c() => {
@@ -1487,7 +1539,7 @@ pub async fn main() -> ExitCode {
     let mut ret_code = 0;
 
     if let Err(error) = run_main(cli).await {
-        log::error!(%error);
+        log::error!(error = %format_args!("{error:#}"));
         ret_code = 1;
     }
 
@@ -1528,6 +1580,64 @@ mod tests {
     /// Parses the flags the way the binary does.
     fn parse_flags(argv: &[&str]) -> Result<FlagsPatch, clap::Error> {
         flags_from(&cli_command().try_get_matches_from(argv)?)
+    }
+
+    #[test]
+    fn shared_runtime_is_process_only_and_reuses_thread_count() {
+        let cpus = std::thread::available_parallelism().map_or(1, |count| count.get() as u32);
+        for (args, shared, expected_count) in [
+            (vec![], false, Flags::defaults().multi_thread_count),
+            (vec!["--shared-runtime"], true, cpus),
+            (vec!["--multi-thread-count", "4"], false, 4),
+            (
+                vec![
+                    "--shared-runtime",
+                    "--multi-thread-count",
+                    "1",
+                    "--multi-thread",
+                    "false",
+                ],
+                true,
+                1,
+            ),
+            (
+                vec![
+                    "--shared-runtime",
+                    "--multi-thread-count",
+                    "4",
+                    "-c",
+                    "a.toml",
+                    "b.toml",
+                ],
+                true,
+                4,
+            ),
+        ] {
+            let matches = cli_command()
+                .try_get_matches_from(std::iter::once("easytier-core").chain(args))
+                .unwrap();
+            let mut cli = Cli::from_arg_matches(&matches).unwrap();
+            cli.network_options.flags = flags_from(&matches).unwrap();
+            assert_eq!(cli.shared_runtime, shared);
+            assert_eq!(cli.take_runtime_thread_count(), expected_count);
+
+            let config = TomlConfigLoader::default();
+            if shared {
+                assert_eq!(cli.network_options.flags.multi_thread, None);
+                assert_eq!(cli.network_options.flags.multi_thread_count, None);
+                assert!(!cli.network_options.can_merge(
+                    &config,
+                    ConfigFileSource::CliConfigFile,
+                    1,
+                    0,
+                ));
+            }
+            cli.network_options.merge_into(&config).unwrap();
+            assert!(!config.dump().contains("shared_runtime"));
+            if cli.network_options.flags.multi_thread_count.is_none() {
+                assert_eq!(config.get_flags_patch().multi_thread_count, None);
+            }
+        }
     }
 
     #[test]
@@ -1755,6 +1865,9 @@ enabled = true
             "--socket-mark",
             "42",
             "--disable-relay-data",
+            "--enable-udp-fec",
+            "--enable-udp-fec-kcp",
+            "--enable-udp-fec-quic",
         ])
         .unwrap();
         assert_eq!(patch.enable_encryption, Some(true));
@@ -1766,11 +1879,66 @@ enabled = true
         );
         assert_eq!(patch.socket_mark, Some(42));
         assert_eq!(patch.disable_relay_data, Some(true));
+        assert_eq!(patch.enable_udp_fec, Some(true));
+        assert_eq!(patch.enable_udp_fec_kcp, Some(true));
+        assert_eq!(patch.enable_udp_fec_quic, Some(true));
         assert_eq!(patch.enable_ipv6, None);
+
+        let patch = parse_flags(&[
+            "easytier",
+            "--enable-udp-fec",
+            "false",
+            "--enable-udp-fec-kcp",
+            "false",
+            "--enable-udp-fec-quic",
+            "false",
+        ])
+        .unwrap();
+        assert_eq!(patch.enable_udp_fec, Some(false));
+        assert_eq!(patch.enable_udp_fec_kcp, Some(false));
+        assert_eq!(patch.enable_udp_fec_quic, Some(false));
 
         // A negated flag can be given bare, and bare means the value it states.
         let patch = parse_flags(&["easytier", "--disable-ipv6"]).unwrap();
         assert_eq!(patch.enable_ipv6, Some(false));
+
+        // Boolish tests: accepts 1/0, yes/no, on/off, true/false
+        assert_eq!(
+            parse_flags(&["easytier", "--latency-first", "1"])
+                .unwrap()
+                .latency_first,
+            Some(true)
+        );
+        assert_eq!(
+            parse_flags(&["easytier", "--latency-first", "0"])
+                .unwrap()
+                .latency_first,
+            Some(false)
+        );
+        assert_eq!(
+            parse_flags(&["easytier", "--latency-first", "yes"])
+                .unwrap()
+                .latency_first,
+            Some(true)
+        );
+        assert_eq!(
+            parse_flags(&["easytier", "--latency-first", "no"])
+                .unwrap()
+                .latency_first,
+            Some(false)
+        );
+        assert_eq!(
+            parse_flags(&["easytier", "--disable-encryption", "1"])
+                .unwrap()
+                .enable_encryption,
+            Some(false)
+        );
+        assert_eq!(
+            parse_flags(&["easytier", "--disable-encryption", "0"])
+                .unwrap()
+                .enable_encryption,
+            Some(true)
+        );
 
         // Compression tests: case-insensitive, accepts None/none/zstd/Zstd/ZSTD, rejects invalid
         let patch = parse_flags(&["easytier", "--compression", "none"]).unwrap();
@@ -1809,6 +1977,26 @@ enabled = true
 
         // Deprecated flag is not accepted.
         assert!(parse_flags(&["easytier", "--quic-listen-port", "1234"]).is_err());
+        assert!(
+            !cli_command()
+                .render_help()
+                .to_string()
+                .contains("tld-dns-zone")
+        );
+        assert!(
+            !cli_command()
+                .render_long_help()
+                .to_string()
+                .contains("tld-dns-zone")
+        );
+        let legacy_cli =
+            Cli::try_parse_from(["easytier-core", "--tld-dns-zone", "custom.local."]).unwrap();
+        let cfg = TomlConfigLoader::default();
+        legacy_cli.network_options.merge_into(&cfg).unwrap();
+        #[allow(deprecated)]
+        {
+            assert_eq!(cfg.get_flags().tld_dns_zone, "custom.local.");
+        }
 
         // MTU tests: u16 range validation
         let patch = parse_flags(&["easytier", "--mtu", "1400"]).unwrap();

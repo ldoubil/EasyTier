@@ -364,13 +364,18 @@ A core instance:
 `CoreProcessRuntime`, plus optional protocol and platform capabilities. The
 bundle carries capabilities, not preconstructed portable managers.
 
-The standard native factory owns one continuously driven Tokio executor per
-instance. `multi_thread` selects a multi-thread or current-thread runtime;
-`multi_thread_count` sets the worker count with the historical minimum of two.
-Construction, start/stop, and FFI data-plane tasks use that executor, independent
-of the process management runtime. Dropping its Host owner shuts down the
-executor without blocking a worker on its own termination. Compact and WASI
-Hosts retain their externally supplied execution model.
+By default, the standard native factory owns one continuously driven Tokio
+executor per instance. `multi_thread` selects a multi-thread or current-thread
+runtime; `multi_thread_count` sets the worker count with the historical minimum
+of two. The `easytier-core --shared-runtime` option instead shares one
+multi-thread executor across the factory and all its instances. Its worker count
+defaults to the available CPU count and can be set with the process-level
+`--multi-thread-count` option, with a minimum of one; per-instance runtime flags
+are ignored in this mode. Construction, start/stop, and FFI data-plane tasks use
+the selected executor, independent of the process management runtime. Dropping
+the last factory or instance Host owner shuts down the executor without blocking
+a worker on its own termination. Compact and WASI Hosts retain their externally
+supplied execution model.
 
 Each Module owns partial-start cleanup for its internal resources.
 `CoreInstance` has one outer cancellation and recovery path for the complete
@@ -502,6 +507,28 @@ behavior:
 - gateway and connectivity settings;
 - runtime configuration patches.
 
+Manual routing retains three distinct states: absent routes select automatic
+routing, a present empty list installs no remote subnet routes, and a present
+nonempty list selects explicit routes. `NetworkConfig.enable_manual_routes`
+preserves this distinction on readback. `InstanceConfigPatch` applies its
+optional `enable_manual_routes` together with route edits in one route
+sub-patch: true retains an empty manual list and false restores automatic
+routing. Omitting the mode preserves released RoutePatch behavior, including
+returning to automatic routing when the edited list becomes empty. This does
+not change the ordered partial-commit contract of a multi-field patch.
+
+`HeartbeatRequest.support_manual_routes_patch` advertises this complete route
+contract, including typed empty-manual readback, on the WebClient Session.
+The Web controller uses the current authenticated heartbeat to choose route
+patches; observed instance configuration caches contain no capability state.
+Released clients omit the flag and still receive
+full configuration replacements for route changes. For their ambiguous empty
+readback, Web reads the existing `GetConfig.toml_config`, or, when absent, the
+instance-scoped `ShowNodeInfo` TOML used by 2.6.4. It reads only the instance ID
+and route field, requires a matching instance, and confirms the actual mode
+before recording application. Supporting clients use typed readback directly;
+compact clients with raw GetConfig need no Peer management RPC.
+
 Host persistence is an effect following a successful core transaction. A Host
 Adapter must not call back into an instance to obtain a hidden configuration
 snapshot while core is applying an operation.
@@ -529,6 +556,13 @@ tracing backend records events and deliberately ignores span trees. The
 optional `tracing` feature selects the tokio-console subscriber integration;
 only that diagnostic profile pulls the main crate's `tracing-subscriber` and
 `console-subscriber` dependencies.
+
+The native CLI enables the `CORE` and `easytier_core::instance::manager` console
+targets by default. Instance startup failures are reported immediately with the
+instance ID and complete error chain, including the listener URL for bind
+failures. When all instances stop, the CLI's failure summary retains each failed
+instance's ID and saved error. Explicit console levels and `RUST_LOG` directives
+still control which records are emitted.
 
 Contrib applications and platform integrations may have independent logging
 requirements and are not implicitly wired to the native process logger.

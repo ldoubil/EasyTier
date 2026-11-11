@@ -51,9 +51,25 @@ where
     // Preserve the existing ordered partial-commit contract: earlier valid
     // sub-patches remain applied if a later sub-patch fails.
     let patch_result: anyhow::Result<(bool, bool)> = async {
-        let result = patch_port_forwards(&candidate, patch.port_forwards);
-        validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
-        result?;
+        if !patch.port_forwards.is_empty() {
+            patch_port_forwards(&candidate, patch.port_forwards)?;
+            // Port forwards have fallible host resources. Reserve them before the
+            // durable write, then commit resources and readback together. A failed
+            // bind or persistence operation must leave the previous rule usable.
+            let normalized = validate_candidate(instance, &candidate)?;
+            let runtime = runtime_config_from_normalized(&normalized);
+            #[cfg(feature = "proxy-smoltcp-stack")]
+            let prepared = instance.prepare_port_forwards(&runtime).await?;
+            persist_candidate_if_changed(instance, &config, &candidate, persistence).await?;
+            instance
+                .commit_runtime_config_under_operation(
+                    runtime,
+                    #[cfg(feature = "proxy-smoltcp-stack")]
+                    prepared,
+                    || config.replace_from_snapshot(&candidate),
+                )
+                .await?;
+        }
 
         let result = patch_acl(&candidate, patch.acl);
         validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
@@ -63,7 +79,7 @@ where
         validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
         result?;
 
-        let result = patch_routes(&candidate, patch.routes);
+        let result = patch_routes(&candidate, patch.routes, patch.enable_manual_routes);
         validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
         result?;
 
@@ -85,6 +101,9 @@ where
         let mut provider_config_changed = false;
         if let Some(hostname) = patch.hostname {
             candidate.set_hostname(Some(hostname));
+        }
+        if let Some(dns) = &patch.dns {
+            patch_dns(&candidate, dns)?;
         }
         if let Some(ipv4) = patch.ipv4
             && !candidate.get_dhcp()
@@ -236,6 +255,26 @@ where
     }
     #[cfg(not(feature = "public-ipv6-provider"))]
     let _ = provider_config_changed;
+    Ok(())
+}
+
+fn patch_dns(
+    candidate: &TomlConfig,
+    patch: &easytier_proto::core_config::DnsConfigRaw,
+) -> anyhow::Result<()> {
+    if patch.zone.is_none() && patch.domain.is_none() {
+        return Ok(());
+    }
+
+    let mut dns = candidate.get_dns().unwrap_or_default();
+    if let Some(zones) = &patch.zone {
+        dns.zone = Some(zones.clone());
+    }
+    if let Some(domain) = &patch.domain {
+        dns.domain = Some(domain.clone());
+    }
+    crate::config::dns::compile_dns(&dns)?;
+    candidate.set_dns(Some(dns));
     Ok(())
 }
 
@@ -455,15 +494,25 @@ fn patch_proxy_networks(
     Ok(())
 }
 
-fn patch_routes(config: &TomlConfig, patches: Vec<RoutePatch>) -> anyhow::Result<()> {
-    if patches.is_empty() {
+fn patch_routes(
+    config: &TomlConfig,
+    patches: Vec<RoutePatch>,
+    enable_manual_routes: Option<bool>,
+) -> anyhow::Result<()> {
+    if patches.is_empty() && enable_manual_routes.is_none() {
         return Ok(());
     }
     let mut current = config.get_routes().unwrap_or_default();
     let patches = patches.into_iter().map(Into::into).collect::<Vec<_>>();
     trace_patchables(&patches);
     config::patch_vec(&mut current, patches);
-    config.set_routes((!current.is_empty()).then_some(current));
+    // Mode and list form one configuration update. An explicit mode supports
+    // empty manual routes; callers omitting it retain the released semantics.
+    config.set_routes(
+        enable_manual_routes
+            .unwrap_or(!current.is_empty())
+            .then_some(current),
+    );
     Ok(())
 }
 
@@ -698,5 +747,99 @@ mod tests {
                 .to_string()
                 .contains("invalid VPN portal client virtual CIDR")
         );
+    }
+}
+
+#[cfg(test)]
+mod dns_tests {
+    use super::*;
+
+    #[test]
+    fn dns_patch_preserves_omissions_and_replaces_complete_zone_list() {
+        use easytier_proto::core_config::DnsConfigRaw;
+
+        let absent = TomlConfig::default();
+        patch_dns(&absent, &DnsConfigRaw::default()).unwrap();
+        assert!(absent.get_dns().is_none());
+
+        let config = TomlConfig::new_from_str(
+            "[dns]\ndomain = 'mesh.test'\n[[dns.zone]]\norigin = 'records.test'\nrecords = [{name = 'host', type = 'A', value = '10.0.0.1'}]",
+        )
+        .unwrap();
+        let original = config.get_dns().unwrap();
+        patch_dns(&config, &DnsConfigRaw::default()).unwrap();
+        assert_eq!(config.get_dns(), Some(original.clone()));
+        patch_dns(
+            &config,
+            &DnsConfigRaw {
+                domain: Some("new.test".to_owned()),
+                zone: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(config.get_dns().unwrap().zone, original.zone);
+        let replacement = easytier_proto::core_config::DnsZoneConfigRaw {
+            origin: "new-origin.test".to_owned(),
+            ..Default::default()
+        };
+        patch_dns(
+            &config,
+            &DnsConfigRaw {
+                domain: None,
+                zone: Some(vec![replacement.clone()].into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(config.get_dns().unwrap().zone.unwrap().items, [replacement]);
+        patch_dns(
+            &config,
+            &DnsConfigRaw {
+                domain: None,
+                zone: Some(Default::default()),
+            },
+        )
+        .unwrap();
+        let cleared = config.get_dns().unwrap();
+        assert_eq!(cleared.domain.as_deref(), Some("new.test"));
+        assert!(cleared.zone.as_ref().unwrap().items.is_empty());
+        for domain in ["", "."] {
+            assert!(
+                patch_dns(
+                    &config,
+                    &DnsConfigRaw {
+                        domain: Some(domain.to_owned()),
+                        zone: None,
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(config.get_dns(), Some(cleared.clone()));
+        }
+        assert!(
+            patch_dns(
+                &config,
+                &DnsConfigRaw {
+                    domain: None,
+                    zone: Some(
+                        vec![easytier_proto::core_config::DnsZoneConfigRaw {
+                            origin: "bad.test".to_owned(),
+                            records: Some(
+                                vec![easytier_proto::core_config::DnsRecordRaw {
+                                    name: "host".to_owned(),
+                                    r#type: easytier_proto::core_config::DnsRecordType::A as i32,
+                                    value: Some("not-an-ip".to_owned()),
+                                    ..Default::default()
+                                }]
+                                .into(),
+                            ),
+                            ..Default::default()
+                        }]
+                        .into()
+                    ),
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(config.get_dns(), Some(cleared));
     }
 }

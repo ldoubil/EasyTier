@@ -152,6 +152,12 @@ pub(super) fn new_wasi_core_runtime(
         adapters.config.ignore_unsupported_config = true;
         adapters.config.endpoint_protocols = host_tunnel_schemes.to_vec();
     }
+    // A WASI guest has no OS TUN, so the TCP subnet proxy can only forward through the
+    // user-space stack. Advertise it whenever it is compiled in; never clear the flag, since
+    // the host-tunnel mode above may rely on it independently of this feature.
+    if cfg!(feature = "proxy-smoltcp-stack") {
+        adapters.config.set_smoltcp_stack(true);
+    }
     #[cfg(feature = "wasm-host-tunnel")]
     #[cfg(not(feature = "wasm-host-tunnel-outbound"))]
     let tunnel_ingress = crate::wasi::adapter::tunnel::WasiHostTunnelIngress::new(
@@ -681,7 +687,9 @@ mod abi {
 
     #[unsafe(no_mangle)]
     /// WASI command entrypoint used only to initialize the host runtime.
-    pub extern "C" fn _start() {}
+    pub extern "C" fn _start() {
+        crate::wasi::logger::init();
+    }
 
     #[unsafe(no_mangle)]
     /// Allocates a guest-owned ABI buffer and returns its linear-memory offset.

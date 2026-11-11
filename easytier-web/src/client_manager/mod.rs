@@ -16,12 +16,21 @@ use std::{
 
 use dashmap::DashMap;
 use easytier::proto::{
-    api::{config::ConfigRpc, manage::WebClientService},
+    api::{
+        config::ConfigRpc,
+        manage::{GetNetworkInstanceConfigRequest, NetworkConfig, WebClientService},
+    },
     rpc_types::controller::BaseController,
     web::{HeartbeatRequest, HeartbeatResponse},
 };
 use easytier_core::{
-    management::remote_client::{self, RemoteClientManager},
+    config::toml::ConfigSource,
+    management::{
+        config_source_from_rpc,
+        remote_client::{
+            self, PersistentConfig as _, RemoteClientError, RemoteClientManager, Storage as _,
+        },
+    },
     socket::SocketListener,
     tunnel::{Tunnel, web_security},
 };
@@ -199,7 +208,6 @@ impl ClientManager {
         self.listeners_cnt.fetch_add(1, Ordering::Relaxed);
         let sessions = self.client_sessions.clone();
         let storage = self.storage.weak_ref();
-        let listeners_cnt = self.listeners_cnt.clone();
         let next_session_epoch = self.next_session_epoch.clone();
         let geoip_db = self.geoip_db.clone();
         let heartbeat_policy = self.heartbeat_policy;
@@ -207,15 +215,15 @@ impl ClientManager {
         let webhook_config = self.webhook_config.clone();
         self.tasks.spawn(async move {
             let mut handshakes = JoinSet::new();
-            'accept: loop {
+            loop {
                 // Some listeners include a WebSocket upgrade in accept(). Keep
                 // that future alive while processing completed handshakes.
-                let accepting = listener.accept();
+                let accepting = easytier_core::socket::retry::accept_with_rebind(&mut listener);
                 tokio::pin!(accepting);
                 loop {
                     let result = tokio::select! {
                         accepted = &mut accepting, if handshakes.len() < MAX_PENDING_HANDSHAKES => {
-                            let Ok(tunnel) = accepted else { break 'accept };
+                            let tunnel = accepted;
                             handshakes.spawn(web_security::accept_or_upgrade_server_tunnel(tunnel));
                             break;
                         }
@@ -258,7 +266,6 @@ impl ClientManager {
                     session.mark_route_ready();
                 }
             }
-            listeners_cnt.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(local_url)
@@ -347,7 +354,11 @@ impl ClientManager {
         ) && let Some(session) = self.get_session_by_machine_id(user_id, &machine_id)
         {
             session
-                .notify_managed_runtime_state_changed(user_id, machine_id)
+                .notify_managed_runtime_state_changed(
+                    user_id,
+                    machine_id,
+                    config_revision.as_deref(),
+                )
                 .await;
         }
         Ok(())
@@ -392,13 +403,17 @@ impl ClientManager {
                 machine_id,
                 ManagedConfigPersistedChange {
                     expected_revision: expected_config_revision,
-                    target_revision: config_revision,
+                    target_revision: config_revision.clone(),
                     dirty_instance_ids,
                 },
             );
             if changed && let Some(session) = self.get_session_by_machine_id(user_id, &machine_id) {
                 session
-                    .notify_managed_runtime_state_changed(user_id, machine_id)
+                    .notify_managed_runtime_state_changed(
+                        user_id,
+                        machine_id,
+                        Some(&config_revision),
+                    )
                     .await;
             }
         }
@@ -416,7 +431,7 @@ impl ClientManager {
             && let Some(session) = self.get_session_by_machine_id(user_id, &machine_id)
         {
             session
-                .notify_managed_runtime_state_changed(user_id, machine_id)
+                .notify_managed_runtime_state_changed(user_id, machine_id, None)
                 .await;
         }
     }
@@ -533,6 +548,7 @@ impl ClientManager {
     }
 }
 
+#[async_trait::async_trait]
 impl
     RemoteClientManager<
         (UserIdInDb, uuid::Uuid),
@@ -564,6 +580,68 @@ impl
         sea_orm::DbErr,
     > {
         self.storage.db()
+    }
+
+    async fn handle_get_network_config_with_source(
+        &self,
+        identify @ (user_id, machine_id): (UserIdInDb, uuid::Uuid),
+        inst_id: uuid::Uuid,
+    ) -> Result<(NetworkConfig, ConfigSource), RemoteClientError<sea_orm::DbErr>> {
+        if let Some(session) = self.get_session_by_machine_id(user_id, &machine_id)
+            && let Ok(response) = session
+                .scoped_rpc_client()
+                .get_network_instance_config(
+                    BaseController::default(),
+                    GetNetworkInstanceConfigRequest {
+                        inst_id: Some(inst_id.into()),
+                    },
+                )
+                .await
+            && let Some(mut config) = response.config
+        {
+            let source = config_source_from_rpc(response.source);
+            let retain_saved_dns = session
+                .get_heartbeat_req()
+                .await
+                .is_none_or(|heartbeat| heartbeat.support_dns_config_patch != Some(true));
+            let saved = if retain_saved_dns || source.is_none() {
+                self.storage
+                    .db()
+                    .get_network_config(identify, &inst_id.to_string())
+                    .await
+                    .map_err(RemoteClientError::PersistentError)?
+            } else {
+                None
+            };
+            if retain_saved_dns && let Some(saved) = &saved {
+                // The editor must retain DNS intent that this core cannot return.
+                config.dns = saved
+                    .get_network_config()
+                    .map_err(RemoteClientError::PersistentError)?
+                    .dns;
+            }
+            let source = source.unwrap_or_else(|| {
+                saved
+                    .map(|config| config.get_runtime_network_config_source())
+                    .unwrap_or(ConfigSource::User)
+            });
+            return Ok((config, source));
+        }
+        let saved = self
+            .storage
+            .db()
+            .get_network_config(identify, &inst_id.to_string())
+            .await
+            .map_err(RemoteClientError::PersistentError)?
+            .ok_or_else(|| {
+                RemoteClientError::NotFound(format!("No such network instance: {inst_id}"))
+            })?;
+        Ok((
+            saved
+                .get_network_config()
+                .map_err(RemoteClientError::PersistentError)?,
+            saved.get_runtime_network_config_source(),
+        ))
     }
 }
 
@@ -651,6 +729,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestWebhookState {
         validate_responses: Arc<tokio::sync::Mutex<VecDeque<bool>>>,
+        config_revision: Arc<tokio::sync::RwLock<String>>,
         validate_count: Arc<AtomicUsize>,
         block_second_validate: Arc<AtomicBool>,
         allow_second_validate: Arc<AtomicBool>,
@@ -665,6 +744,7 @@ mod tests {
                 validate_responses: Arc::new(tokio::sync::Mutex::new(
                     validate_responses.into_iter().collect(),
                 )),
+                config_revision: Arc::new(tokio::sync::RwLock::new("rev-initial".to_owned())),
                 validate_count: Arc::new(AtomicUsize::new(0)),
                 block_second_validate: Arc::new(AtomicBool::new(false)),
                 allow_second_validate: Arc::new(AtomicBool::new(true)),
@@ -728,8 +808,8 @@ mod tests {
 
         Json(json!({
             "valid": true,
-            "binding_version": count,
-            "config_revision": format!("validated-rev-{count}")
+            "binding_version": 1,
+            "config_revision": state.config_revision.read().await.clone()
         }))
     }
 
@@ -1269,8 +1349,306 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_edit_readback_preserves_saved_intent_without_replacing_observed_fields() {
+        use easytier::proto::{
+            api::manage::{
+                GetNetworkInstanceConfigRequest, GetNetworkInstanceConfigResponse,
+                ListNetworkInstanceMetaResponse, ListNetworkInstanceResponse,
+                RunNetworkInstanceRequest, RunNetworkInstanceResponse, ValidateConfigRequest,
+                ValidateConfigResponse, WebClientServiceDescriptor,
+                WebClientServiceMethodDescriptor,
+            },
+            rpc::bidirect::BidirectRpcManager,
+            rpc_types::handler::Handler,
+            web::{HeartbeatRequest, WebServerServiceClientFactory},
+        };
+        use prost::Message as _;
+
+        #[derive(Default)]
+        struct Requests {
+            runs: Vec<RunNetworkInstanceRequest>,
+            validations: Vec<ValidateConfigRequest>,
+            runtime_config: Option<NetworkConfig>,
+        }
+        #[derive(Clone)]
+        struct Recorder {
+            instance_id: uuid::Uuid,
+            requests: Arc<std::sync::Mutex<Requests>>,
+        }
+        #[async_trait::async_trait]
+        impl Handler for Recorder {
+            type Descriptor = WebClientServiceDescriptor;
+            type Controller = super::BaseController;
+
+            async fn call(
+                &self,
+                _: Self::Controller,
+                method: WebClientServiceMethodDescriptor,
+                input: prost::bytes::Bytes,
+            ) -> easytier::proto::rpc_types::error::Result<prost::bytes::Bytes> {
+                let mut requests = self.requests.lock().unwrap();
+                let response = match method {
+                    WebClientServiceMethodDescriptor::RunNetworkInstance => {
+                        let request = RunNetworkInstanceRequest::decode(input)?;
+                        requests.runtime_config = request.config.clone();
+                        requests.runs.push(request);
+                        RunNetworkInstanceResponse {
+                            inst_id: Some(self.instance_id.into()),
+                        }
+                        .encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::ValidateConfig => {
+                        requests
+                            .validations
+                            .push(ValidateConfigRequest::decode(input)?);
+                        ValidateConfigResponse::default().encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::GetNetworkInstanceConfig => {
+                        let request = GetNetworkInstanceConfigRequest::decode(input)?;
+                        assert_eq!(
+                            request.inst_id.map(uuid::Uuid::from),
+                            Some(self.instance_id)
+                        );
+                        GetNetworkInstanceConfigResponse {
+                            config: requests.runtime_config.clone(),
+                            source: easytier::proto::api::manage::ConfigSource::User as i32,
+                        }
+                        .encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::DeleteNetworkInstance => {
+                        requests.runtime_config = None;
+                        easytier::proto::api::manage::DeleteNetworkInstanceResponse::default()
+                            .encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::ListNetworkInstance => {
+                        ListNetworkInstanceResponse::default().encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::ListNetworkInstanceMeta => {
+                        ListNetworkInstanceMetaResponse::default().encode_to_vec()
+                    }
+                    _ => panic!("unexpected direct runtime method: {method:?}"),
+                };
+                Ok(response.into())
+            }
+        }
+
+        let db = Db::memory_db().await;
+        let mgr = ClientManager::new(
+            db.clone(),
+            None,
+            HeartbeatPolicy::default(),
+            Arc::new(FeatureFlags::default()),
+            Arc::new(crate::webhook::WebhookConfig::new(
+                None, None, None, None, None,
+            )),
+        );
+        let user_id = db
+            .auto_create_user("dns-capability-token")
+            .await
+            .unwrap()
+            .id;
+        let machine_id = uuid::Uuid::new_v4();
+        let instance_id = uuid::Uuid::new_v4();
+        let identify = (user_id, machine_id);
+        let saved = NetworkConfig {
+            instance_id: Some(instance_id.to_string()),
+            hostname: Some("dns-capability-host".to_owned()),
+            networking_method: Some(NetworkingMethod::Standalone as i32),
+            dns: Some(easytier::proto::core_config::DnsConfigRaw {
+                domain: Some("retained.test".to_owned()),
+                zone: None,
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            mgr.handle_validate_config(identify, saved.clone()).await,
+            Err(super::RemoteClientError::ClientNotFound)
+        ));
+        assert!(matches!(
+            mgr.handle_run_network_instance(identify, saved.clone(), true)
+                .await,
+            Err(super::RemoteClientError::ClientNotFound)
+        ));
+
+        let requests = Arc::new(std::sync::Mutex::new(Requests::default()));
+        let rpc = BidirectRpcManager::new();
+        rpc.rpc_server().registry().register(
+            Recorder {
+                instance_id,
+                requests: requests.clone(),
+            },
+            "",
+        );
+        let client_url = "ring://dns-capability".parse::<url::Url>().unwrap();
+        let mut session = Session::new(
+            mgr.storage.weak_ref(),
+            client_url.clone(),
+            None,
+            HeartbeatPolicy::default(),
+            Arc::new(FeatureFlags::default()),
+            Arc::new(crate::webhook::WebhookConfig::new(
+                None, None, None, None, None,
+            )),
+            1,
+        );
+        session.serve(rpc.run_and_create_tunnel()).await;
+        let session = Arc::new(session);
+        mgr.client_sessions
+            .insert(client_url.clone(), session.clone());
+        mgr.storage.update_client(
+            StorageToken {
+                token: "dns-capability-token".to_owned(),
+                client_url,
+                machine_id,
+                user_id,
+            },
+            1,
+            true,
+        );
+        mgr.handle_run_network_instance(identify, saved.clone(), true)
+            .await
+            .unwrap();
+        {
+            let mut observed = requests.lock().unwrap();
+            let config = observed.runtime_config.as_mut().unwrap();
+            config.dns = None;
+            config.hostname = Some("observed-before-heartbeat".to_owned());
+        }
+        assert!(session.get_heartbeat_req().await.is_none());
+        let editable = mgr
+            .handle_get_network_config(identify, instance_id)
+            .await
+            .unwrap();
+        assert_eq!(editable.dns, saved.dns);
+        assert_eq!(
+            editable.hostname.as_deref(),
+            Some("observed-before-heartbeat")
+        );
+        requests.lock().unwrap().runs.clear();
+
+        let heartbeat_client = rpc
+            .rpc_client()
+            .scoped_client::<WebServerServiceClientFactory<super::BaseController>>(
+                1,
+                1,
+                String::new(),
+            );
+        let runtime_id = uuid::Uuid::new_v4();
+        for (index, supported) in [false, true, false].into_iter().enumerate() {
+            heartbeat_client
+                .heartbeat(
+                    super::BaseController::default(),
+                    HeartbeatRequest {
+                        machine_id: Some(machine_id.into()),
+                        inst_id: Some(runtime_id.into()),
+                        user_token: "dns-capability-token".to_owned(),
+                        report_time: chrono::Local::now().to_rfc3339(),
+                        support_config_source: true,
+                        support_heartbeat_policy: true,
+                        support_manual_routes_patch: true,
+                        support_dns_config_patch: Some(supported),
+                        running_network_instances: vec![instance_id.into()],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mgr.handle_validate_config(identify, saved.clone())
+                .await
+                .unwrap();
+            mgr.handle_run_network_instance(identify, saved.clone(), index == 2)
+                .await
+                .unwrap();
+            {
+                let mut observed = requests.lock().unwrap();
+                let config = observed.runtime_config.as_mut().unwrap();
+                config.dns = supported.then(|| easytier::proto::core_config::DnsConfigRaw {
+                    domain: Some("observed.test".to_owned()),
+                    ..Default::default()
+                });
+            }
+            let (editable, source) = mgr
+                .handle_get_network_config_with_source(identify, instance_id)
+                .await
+                .unwrap();
+            assert_eq!(source, ConfigSource::User);
+            assert_eq!(editable.hostname, saved.hostname);
+            assert_eq!(
+                editable.dns.as_ref().unwrap().domain.as_deref(),
+                Some(if supported {
+                    "observed.test"
+                } else {
+                    "retained.test"
+                })
+            );
+        }
+        let editable = mgr
+            .handle_get_network_config(identify, instance_id)
+            .await
+            .unwrap();
+        assert_eq!(editable, saved);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .runtime_config
+                .as_ref()
+                .unwrap()
+                .dns
+                .is_none()
+        );
+        mgr.handle_save_network_config(identify, instance_id, editable)
+            .await
+            .unwrap();
+        mgr.handle_update_network_state(identify, instance_id, true)
+            .await
+            .unwrap();
+        mgr.handle_update_network_state(identify, instance_id, false)
+            .await
+            .unwrap();
+
+        {
+            let observed = requests.lock().unwrap();
+            assert_eq!(observed.validations.len(), 3);
+            assert_eq!(observed.runs.len(), 4);
+            for index in 0..3 {
+                let target = saved.clone();
+                assert_eq!(observed.validations[index].config, Some(target.clone()));
+                assert_eq!(observed.runs[index].config, Some(target));
+                assert!(observed.runs[index].overwrite);
+                assert!(observed.runs[index].inst_id.is_none());
+            }
+            let restarted = &observed.runs[3];
+            assert_eq!(restarted.config.as_ref().unwrap().dns, saved.dns);
+            assert_eq!(restarted.inst_id.map(uuid::Uuid::from), Some(instance_id));
+            assert!(restarted.overwrite);
+            assert!(observed.runs.iter().all(|request| {
+                request.source == easytier::proto::api::manage::ConfigSource::User as i32
+            }));
+        }
+        let persisted = db
+            .get_network_config(identify, &instance_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let persisted_config: NetworkConfig =
+            serde_json::from_str(&persisted.network_config).unwrap();
+        assert_eq!(persisted_config, saved);
+        assert!(!persisted.disabled);
+        session.stop().await;
+        rpc.stop().await;
+        assert_eq!(
+            mgr.handle_get_network_config(identify, instance_id)
+                .await
+                .unwrap(),
+            saved
+        );
+    }
+
+    #[tokio::test]
     async fn compact_runtime_preserves_unsupported_web_config_during_hot_patch() {
-        let (webhook_config, webhook_server, _) = test_webhook_config().await;
+        let (webhook_config, webhook_server, webhook_state) = test_webhook_config().await;
+        *webhook_state.config_revision.write().await = "compact-initial".to_owned();
         let mut mgr = ClientManager::new(
             Db::memory_db().await,
             None,
@@ -1289,9 +1667,17 @@ mod tests {
             start_web_client_for_test(config_server_addr, machine_id, core_manager.clone()).await;
         let user_id = wait_for_validated_user(&mgr, machine_id).await;
 
-        let desired = updated_managed_network_config(instance_id);
+        let mut desired = updated_managed_network_config(instance_id);
+        desired["dns"] = json!({
+            "domain": "saved.test",
+            "zone": [{
+                "origin": "records.test",
+                "records": [{"name": "info", "type": "TXT", "value": "\"first\" \"second\""}]
+            }]
+        });
         let mut initial = desired.clone();
         initial["port_forwards"] = json!([]);
+        initial["dns"] = json!({"domain": "initial.test"});
         mgr.reconcile_managed_network_configs(
             user_id,
             machine_id,
@@ -1307,6 +1693,7 @@ mod tests {
         })
         .await;
 
+        *webhook_state.config_revision.write().await = "compact-patched".to_owned();
         mgr.reconcile_managed_network_configs(
             user_id,
             machine_id,
@@ -1324,6 +1711,23 @@ mod tests {
 
         assert_updated_runtime_config(&patched, instance_id);
         assert_eq!(
+            patched.dns.as_ref().unwrap().domain.as_deref(),
+            Some("saved.test")
+        );
+        assert_eq!(
+            patched
+                .dns
+                .as_ref()
+                .unwrap()
+                .zone
+                .as_ref()
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        wait_for_applied_revision(&mgr, user_id, machine_id, "compact-patched").await;
+        assert_eq!(
             mgr.db()
                 .get_managed_config_revision((user_id, machine_id))
                 .await
@@ -1335,8 +1739,283 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receiver_takeover_preserves_running_core_until_config_arrives() {
+        for stale_config in [false, true] {
+            let (old_webhook, old_server, _) = test_webhook_config().await;
+            let mut old = ClientManager::new(
+                Db::memory_db().await,
+                None,
+                HeartbeatPolicy::from_millis(1_000, 15_000).unwrap(),
+                Arc::new(FeatureFlags::default()),
+                old_webhook,
+            );
+            let old_addr = add_random_udp_listener(&mut old).await;
+            let machine_id = uuid::Uuid::new_v4();
+            let instance_id = uuid::Uuid::new_v4();
+            let old_user = old
+                .db()
+                .auto_create_user(MANAGED_CONFIG_TOKEN)
+                .await
+                .unwrap()
+                .id;
+            let desired = initial_managed_network_config(instance_id);
+            old.reconcile_managed_network_configs(
+                old_user,
+                machine_id,
+                vec![managed_config(instance_id, desired.clone())],
+                Some("rev-initial".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+            let core = Arc::new(native_instance_manager());
+            let old_client = start_web_client_for_test(old_addr, machine_id, core.clone()).await;
+            wait_for_applied_revision(&old, old_user, machine_id, "rev-initial").await;
+            let original = core.instance(instance_id).unwrap();
+            drop(old_client);
+
+            let state = TestWebhookState::with_blocked_connected([true]);
+            let (webhook, server, state) = test_webhook_config_with_state(state).await;
+            let mut replacement = ClientManager::new(
+                Db::memory_db().await,
+                None,
+                HeartbeatPolicy::from_millis(1_000, 15_000).unwrap(),
+                Arc::new(FeatureFlags::default()),
+                webhook,
+            );
+            let addr = add_random_udp_listener(&mut replacement).await;
+            let user_id = replacement
+                .db()
+                .auto_create_user(MANAGED_CONFIG_TOKEN)
+                .await
+                .unwrap()
+                .id;
+            if stale_config {
+                let obsolete_id = uuid::Uuid::new_v4();
+                replacement
+                    .reconcile_managed_network_configs(
+                        user_id,
+                        machine_id,
+                        vec![managed_config(
+                            obsolete_id,
+                            initial_managed_network_config(obsolete_id),
+                        )],
+                        Some("outdated".to_owned()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let _client = start_web_client_for_test(addr, machine_id, core.clone()).await;
+            wait_for_condition(
+                || async { state.connected_count() == 1 },
+                Duration::from_secs(5),
+            )
+            .await;
+            let session = replacement
+                .get_session_by_machine_id(user_id, &machine_id)
+                .unwrap();
+
+            // Authentication and real heartbeats continue while publication is
+            // withheld. Neither an empty DB nor an obsolete Exact Set owns the
+            // already running Core instance.
+            for _ in 0..3 {
+                let before = session.get_heartbeat_req().await.unwrap().report_time;
+                wait_for_condition(
+                    || async { session.get_heartbeat_req().await.unwrap().report_time != before },
+                    Duration::from_secs(3),
+                )
+                .await;
+                assert_eq!(core.instance_ids(), vec![instance_id]);
+                assert!(Arc::ptr_eq(&original, &core.instance(instance_id).unwrap()));
+                assert!(session.applied_config_revision().await.is_none());
+            }
+
+            state.allow_connected();
+            // Registration must wake validation before its ten-heartbeat
+            // periodic cadence, without repeatedly registering the same binding.
+            wait_for_condition(
+                || async { state.validate_count() == 2 },
+                Duration::from_secs(2),
+            )
+            .await;
+            assert_eq!(state.connected_count(), 1);
+            assert!(Arc::ptr_eq(&original, &core.instance(instance_id).unwrap()));
+
+            replacement
+                .reconcile_managed_network_configs(
+                    user_id,
+                    machine_id,
+                    vec![managed_config(instance_id, desired)],
+                    Some("rev-initial".to_owned()),
+                    None,
+                )
+                .await
+                .unwrap();
+            wait_for_applied_revision(&replacement, user_id, machine_id, "rev-initial").await;
+            assert_eq!(core.instance_ids(), vec![instance_id]);
+            assert!(Arc::ptr_eq(&original, &core.instance(instance_id).unwrap()));
+
+            // A versioned authoritative empty set still removes web-owned
+            // instances and keeps the authenticated management session alive.
+            *state.config_revision.write().await = "empty".to_owned();
+            replacement
+                .reconcile_managed_network_configs(
+                    user_id,
+                    machine_id,
+                    Vec::new(),
+                    Some("empty".to_owned()),
+                    Some("rev-initial".to_owned()),
+                )
+                .await
+                .unwrap();
+            wait_for_applied_revision(&replacement, user_id, machine_id, "empty").await;
+            assert!(core.instance_ids().is_empty());
+            assert!(
+                replacement
+                    .get_session_by_machine_id(user_id, &machine_id)
+                    .is_some()
+            );
+            server.abort();
+            old_server.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "1000 real management connections; run explicitly with a raised file limit"]
+    async fn receiver_takeover_wave_allows_an_independent_mount() {
+        use futures::StreamExt;
+
+        let (old_webhook, old_server, _) = test_webhook_config().await;
+        let mut old = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            HeartbeatPolicy::default(),
+            Arc::new(FeatureFlags::default()),
+            old_webhook,
+        );
+        let old_addr = add_random_udp_listener(&mut old).await;
+        let (webhook, server, state) = test_webhook_config().await;
+        let mut replacement = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            HeartbeatPolicy::default(),
+            Arc::new(FeatureFlags::default()),
+            webhook,
+        );
+        let addr = add_random_udp_listener(&mut replacement).await;
+        // Provision the account once: password hashing is unrelated to a wave
+        // of existing devices reconnecting to another receiver.
+        let old_user = old
+            .db()
+            .auto_create_user(MANAGED_CONFIG_TOKEN)
+            .await
+            .unwrap()
+            .id;
+        let user_id = replacement
+            .db()
+            .auto_create_user(MANAGED_CONFIG_TOKEN)
+            .await
+            .unwrap()
+            .id;
+        let devices: Vec<_> = (0..1_000)
+            .map(|_| {
+                (
+                    uuid::Uuid::new_v4(),
+                    Arc::new(native_compact_instance_manager_with_runtime(
+                        tokio::runtime::Handle::current(),
+                    )),
+                )
+            })
+            .collect();
+        let old_clients: Vec<_> = futures::stream::iter(&devices)
+            .map(|(machine_id, core)| async {
+                old.reconcile_managed_network_configs(
+                    old_user,
+                    *machine_id,
+                    Vec::new(),
+                    Some("rev-initial".to_owned()),
+                    None,
+                )
+                .await
+                .unwrap();
+                let client = start_web_client_for_test(old_addr, *machine_id, core.clone()).await;
+                wait_for_applied_revision(&old, old_user, *machine_id, "rev-initial").await;
+                client
+            })
+            .buffer_unordered(64)
+            .collect()
+            .await;
+
+        let mount_machine = uuid::Uuid::new_v4();
+        let mount_core = Arc::new(native_compact_instance_manager_with_runtime(
+            tokio::runtime::Handle::current(),
+        ));
+        let _mount_client =
+            start_web_client_for_test(addr, mount_machine, mount_core.clone()).await;
+        wait_for_validated_user(&replacement, mount_machine).await;
+        drop(old_clients);
+        let started = tokio::time::Instant::now();
+        let takeover = futures::stream::iter(&devices)
+            .map(|(machine_id, core)| async {
+                let client = start_web_client_for_test(addr, *machine_id, core.clone()).await;
+                wait_for_validated_user(&replacement, *machine_id).await;
+                replacement
+                    .reconcile_managed_network_configs(
+                        user_id,
+                        *machine_id,
+                        Vec::new(),
+                        Some("rev-initial".to_owned()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                wait_for_applied_revision(&replacement, user_id, *machine_id, "rev-initial").await;
+                client
+            })
+            .buffer_unordered(64)
+            .collect::<Vec<_>>();
+        let mount = async {
+            wait_for_condition(
+                || async { state.connected_count() >= 11 },
+                Duration::from_secs(12),
+            )
+            .await;
+            let started = tokio::time::Instant::now();
+            let instance_id = uuid::Uuid::new_v4();
+            replacement
+                .reconcile_managed_network_configs(
+                    user_id,
+                    mount_machine,
+                    vec![managed_config(
+                        instance_id,
+                        initial_managed_network_config(instance_id),
+                    )],
+                    Some("rev-initial".to_owned()),
+                    None,
+                )
+                .await
+                .unwrap();
+            wait_for_applied_revision(&replacement, user_id, mount_machine, "rev-initial").await;
+            assert_eq!(mount_core.instance_ids(), vec![instance_id]);
+            started.elapsed()
+        };
+        let (clients, mount_elapsed) = tokio::join!(takeover, mount);
+        assert_eq!(clients.len(), 1_000);
+        assert_eq!(replacement.list_sessions().await.len(), 1_001);
+        println!(
+            "1000 receiver takeovers: {:?}; independent mount: {:?}; validations: {}",
+            started.elapsed(),
+            mount_elapsed,
+            state.validate_count()
+        );
+        server.abort();
+        old_server.abort();
+    }
+
+    #[tokio::test]
     async fn managed_web_config_revision_updates_running_core_config() {
-        let (webhook_config, webhook_server, _) = test_webhook_config().await;
+        let (webhook_config, webhook_server, webhook_state) = test_webhook_config().await;
         let mut mgr = ClientManager::new(
             Db::memory_db().await,
             None,
@@ -1400,6 +2079,7 @@ mod tests {
 
         // Online revision update: web-owned running config is fully overwritten
         // when non-hot-patch flags such as enable_kcp_proxy change.
+        *webhook_state.config_revision.write().await = "rev-updated".to_owned();
         mgr.reconcile_managed_network_configs(
             user_id,
             machine_id,
@@ -1454,6 +2134,7 @@ mod tests {
                 .is_none()
         );
 
+        *webhook_state.config_revision.write().await = "rev-webhook-redelivery".to_owned();
         mgr.reconcile_managed_network_configs(
             user_id,
             machine_id,

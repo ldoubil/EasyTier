@@ -53,6 +53,7 @@ jobs:
         with:
           concurrent_skipping: 'same_content_newer'
           skip_after_successful_duplicate: 'true'
+          do_not_skip: '["pull_request", "workflow_dispatch", "schedule", "merge_group"]'
           cancel_others: 'true'
           paths: '["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**", "easytier/**", "easytier-core/**", "easytier-proto/**", "easytier-contrib/easytier-ohrs/**", ".github/workflows/ohos.yml", ".github/actions/**"]'
 
@@ -138,7 +139,8 @@ jobs:
           set -euo pipefail
           cargo_version=$(cargo metadata --format-version 1 --no-deps \
             --manifest-path easytier/Cargo.toml | jq -r '.packages[0].version')
-          last_tag=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)
+          # Rolling tags such as nightly are not package versions.
+          last_tag=$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD 2>/dev/null || true)
           if [ -n "$last_tag" ]; then
             base_version=$(printf '%s\n' "$cargo_version" "${last_tag#v}" \
               | sort -V | tail -n 1)

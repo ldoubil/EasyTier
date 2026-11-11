@@ -9,6 +9,7 @@ import {
   type VpnPortalConfig,
 } from '../generated/proto/api_manage'
 import { ScalarType } from '@protobuf-ts/runtime'
+import { DnsRecordType, type DnsRecordRaw } from '../generated/proto/core_config'
 import type { FlagMeta } from '../generated/proto/annotations'
 import {
   VpnPortalClientState,
@@ -37,9 +38,35 @@ import {
 } from '../generated/proto/common'
 import { prepareNetworkConfigForProtoJson } from './networkCompat'
 
-export { AclAction, AclChainType, AclProtocol, CompressionAlgoPb, NatType, NetworkingMethod }
+export { AclAction, AclChainType, AclProtocol, CompressionAlgoPb, DnsRecordType, NatType, NetworkingMethod }
 export { VpnPortalClientState }
 export type { Acl, AclChain, AclRule, AclV1, GroupIdentity, GroupInfo, NetworkPeerConfig, PeerFeatureFlag, PortForwardConfig, SecureModeConfig, VpnPortalClientConfig, VpnPortalClientInfo, VpnPortalConfig, VpnPortalInfo }
+
+export const PEER_PROTOCOLS: { [proto: string]: number } = {
+  tcp: 11010,
+  udp: 11010,
+  wg: 11011,
+  ws: 11011,
+  wss: 11012,
+  quic: 11012,
+  faketcp: 11013,
+  http: 80,
+  https: 443,
+  txt: 0,
+  srv: 0,
+}
+
+// Configuration JSON uses transparent repeated wrappers, as Rust Serde does.
+// Derive the value types from the protocol schema rather than copying fields.
+type ConfigJson<T> = T extends { items: Array<infer Item> }
+  ? ConfigJson<Item>[]
+  : T extends DnsRecordRaw
+    ? ConfigJson<Omit<T, 'type'>>
+      & { type: DnsRecordType | keyof typeof DnsRecordType }
+    : T extends object ? { [Key in keyof T]: ConfigJson<T[Key]> } : T
+
+export type DnsConfig = ConfigJson<NonNullable<ProtoNetworkConfig['dns']>>
+export type DnsRecord = ConfigJson<DnsRecordRaw>
 
 export type NetworkConfig = Omit<
   ProtoNetworkConfig,
@@ -47,8 +74,10 @@ export type NetworkConfig = Omit<
   | 'instance_recv_bps_limit'
   | 'mtu'
   | 'networking_method'
+  | 'dns'
 > & {
   instance_id: string
+  dns?: DnsConfig
   mtu: number | null
   instance_recv_bps_limit: number | string | null
   networking_method: NetworkingMethod | string
@@ -156,6 +185,7 @@ function newFlagValues(): Record<string, boolean> {
 export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
   return {
     ...NetworkConfigPb.create(),
+    dns: undefined,
 
     instance_id: uuidv4(),
 
@@ -345,9 +375,11 @@ function applyNetworkingMethod(
 }
 
 export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
-  const normalized = NetworkConfigPb.fromJson(prepareNetworkConfigForProtoJson(config) as any, {
+  const { dns, ...protoConfig } = prepareNetworkConfigForProtoJson(config)
+  const normalized = NetworkConfigPb.fromJson(protoConfig as any, {
     ignoreUnknownFields: true,
   }) as unknown as NetworkConfig
+  normalized.dns = dns
 
   applyNetworkingMethod(normalized, { fillPeerUrlsFromPeers: true })
   normalized.mtu = normalizeNumberForInput(normalized.mtu)
@@ -382,7 +414,8 @@ export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
 }
 
 export function toBackendNetworkConfig(config: NetworkConfig): NetworkConfig {
-  const backend = NetworkConfigPb.fromJson(prepareNetworkConfigForProtoJson(config) as any, {
+  const { dns, ...protoConfig } = prepareNetworkConfigForProtoJson(config)
+  const backend = NetworkConfigPb.fromJson(protoConfig as any, {
     ignoreUnknownFields: true,
   })
 
@@ -402,9 +435,11 @@ export function toBackendNetworkConfig(config: NetworkConfig): NetworkConfig {
     backend.secure_mode = { enabled: true, local_private_key: credentialSecret }
   }
 
-  return NetworkConfigPb.toJson(backend, {
+  const result = NetworkConfigPb.toJson(backend, {
     useProtoFieldName: true,
   }) as unknown as NetworkConfig
+  if (dns !== undefined) result.dns = dns
+  return result
 }
 
 export function normalizeVpnPortalInfo(info: unknown): VpnPortalInfo {

@@ -2693,6 +2693,7 @@ dependencies = [
  "hyper-util",
  "idna",
  "lzokay-native",
+ "once_cell",
  "openssl",
  "optionize",
  "ordered_hash_map",

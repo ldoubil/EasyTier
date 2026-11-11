@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 #[cfg(not(mobile))]
 use easytier_core::instance::CorePacketPlane;
@@ -161,31 +164,66 @@ impl NativeDhcpHost {
         {
             let addresses = self.with_static_addresses(next);
             if !self.global_ctx.no_tun() && (addresses.ipv4.is_some() || addresses.ipv6.is_some()) {
-                let mut nic = NicCtx::new(
-                    self.global_ctx.clone(),
-                    self.packet_plane.clone(),
-                    self.nic.receiver(),
-                    self.closed.clone(),
-                    self.shared_virtual_nic_registry.clone(),
-                )
-                .await;
-                tokio::select! {
-                    _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
-                    result = nic.run(addresses.ipv4, addresses.ipv6) => result?,
-                }
-                let magic_dns = if let Some(ip) = addresses.ipv4 {
-                    let shared_route_backend = nic.shared_route_backend_for_dns();
-                    MagicDnsRuntime::start(
+                // Windows 新建 Wintun 适配器后，IP 层偶尔还没就绪（87/1168）。
+                // add_ip_address 内部已经做 4s 重试；这里再做一次整体重建：
+                // 丢弃当前 NicCtx，重新 create_dev -> 等接口就绪 -> 分配地址 -> 安装路由，
+                // 等价于把适配器彻底重建一次。
+                const MAX_NIC_ATTEMPTS: u32 = 2;
+                let mut last_error = None;
+                for attempt in 1..=MAX_NIC_ATTEMPTS {
+                    let mut nic = NicCtx::new(
                         self.global_ctx.clone(),
                         self.packet_plane.clone(),
-                        nic.ifname().await,
-                        ip,
-                        shared_route_backend,
+                        self.nic.receiver(),
+                        self.closed.clone(),
+                        self.shared_virtual_nic_registry.clone(),
                     )
-                } else {
-                    MagicDnsRuntime::default()
-                };
-                self.nic.install(nic, magic_dns).await;
+                    .await;
+                    let run_result = tokio::select! {
+                        _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
+                        result = nic.run(addresses.ipv4, addresses.ipv6) => result,
+                    };
+                    match run_result {
+                        Ok(()) => {
+                            let magic_dns = if let Some(ip) = addresses.ipv4 {
+                                let shared_route_backend = nic.shared_route_backend_for_dns();
+                                MagicDnsRuntime::start(
+                                    self.global_ctx.clone(),
+                                    self.packet_plane.clone(),
+                                    nic.ifname().await,
+                                    ip,
+                                    shared_route_backend,
+                                )
+                            } else {
+                                MagicDnsRuntime::default()
+                            };
+                            self.nic.install(nic, magic_dns).await;
+                            last_error = None;
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                attempt,
+                                max_attempts = MAX_NIC_ATTEMPTS,
+                                ?error,
+                                "failed to set up native interface, rebuilding"
+                            );
+                            last_error = Some(error);
+                            if attempt < MAX_NIC_ATTEMPTS {
+                                tokio::select! {
+                                    _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
+                                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(error) = last_error {
+                    // 重建也失败：把最终错误交给 DHCP 服务，由它记录
+                    // “DHCP apply failed” 并按退避继续下一轮；global_ctx 里
+                    // 的地址已经在上面重置为空，不会留下过期 IP。
+                    return Err(error.into());
+                }
             }
         }
         self.set_addresses(next);

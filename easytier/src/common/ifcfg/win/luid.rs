@@ -56,6 +56,22 @@ impl InterfaceLuid {
         }
     }
 
+    /// 判断该接口是否已经出现在 IPv4 协议栈中。
+    ///
+    /// 这里必须用 GetIpInterfaceEntry(AF_INET)，不能用 GetIfEntry/SetIfEntry
+    /// 的网卡状态：现场日志里 link_up 是成功的，真正失败的是 IP 层的
+    /// SetIpInterfaceEntry（1168）和 CreateUnicastIpAddressEntry（87），
+    /// 只有前者查的是同一张 IPv4 接口表。
+    pub fn is_ipv4_interface_ready(&self) -> bool {
+        let mut row = MIB_IPINTERFACE_ROW {
+            Family: AF_INET as ADDRESS_FAMILY,
+            InterfaceLuid: self.luid,
+            ..Default::default()
+        };
+        let result = unsafe { GetIpInterfaceEntry(&mut row) };
+        result == NO_ERROR
+    }
+
     /// add_ipv6_address method adds new unicast IP address to the interface. Corresponds to CreateUnicastIpAddressEntry function
     /// (https://docs.microsoft.com/en-us/windows/desktop/api/netioapi/nf-netioapi-createunicastipaddressentry).
     pub fn add_ipv6_address(&self, address: &Ipv6Inet) -> Result<(), NETIO_STATUS> {

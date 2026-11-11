@@ -73,6 +73,7 @@ impl NativeTunRuntime {
         let (output, first_round) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut output = Some(output);
+            let mut first_round_failures = 0u32;
             loop {
                 if cancel.is_cancelled() {
                     Self::report_static_ip_cancelled(&mut output);
@@ -97,6 +98,20 @@ impl NativeTunRuntime {
                     result = nic.run(ipv4, ipv6) => result,
                 };
                 if let Err(error) = result {
+                    first_round_failures += 1;
+                    // 首轮也允许重建一次：新建 Wintun 适配器后 IP 层可能还没就绪，
+                    // 直接失败会让整个实例起不来，而重建通常就能拿到新的 LUID。
+                    if output.is_some() && first_round_failures <= 1 {
+                        tracing::warn!(
+                            ?error,
+                            "failed to set up native interface on first attempt, rebuilding once"
+                        );
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
+                        continue;
+                    }
                     if let Some(output) = output.take() {
                         let _ = output.send(Err(error));
                         return;

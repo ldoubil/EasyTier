@@ -22,6 +22,18 @@ pub enum Error {
     ShellCommandError(String),
     #[error("Timeout error: {0}")]
     Timeout(#[from] tokio::time::error::Elapsed),
+    /// Windows 网卡在系统里可见，但 IP 层还没准备好接受地址配置。
+    /// 调用方可以据此决定“重建一次 NIC”，而不是把它当成普通的 IO 失败。
+    #[error(
+        "interface `{ifname}` not ready for {operation}: {attempts} attempt(s) in {elapsed_ms} ms, last error: {last_error}"
+    )]
+    InterfaceNotReady {
+        ifname: String,
+        operation: &'static str,
+        attempts: u32,
+        elapsed_ms: u64,
+        last_error: String,
+    },
     #[error("anyhow error: {0}")]
     AnyhowError(#[from] anyhow::Error),
 }

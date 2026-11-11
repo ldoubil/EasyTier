@@ -6,10 +6,11 @@ use cidr::{Ipv4Inet, Ipv6Inet};
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr},
+    time::{Duration, Instant},
 };
 use windows::Win32::NetworkManagement::IpHelper::INTERNAL_IF_OPER_STATUS;
 use windows::Win32::{
-    Foundation::{ERROR_NOT_FOUND, NO_ERROR},
+    Foundation::{ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, NO_ERROR},
     NetworkManagement::IpHelper::{GetIfEntry, MIB_IFROW, SetIfEntry},
     System::Diagnostics::Debug::{
         FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
@@ -57,6 +58,26 @@ fn format_win_error(error: u32) -> String {
     )
 }
 
+/// Windows 新建 Wintun 适配器后，接口进入 IPv4 协议栈需要一小段时间；
+/// 这期间 CreateUnicastIpAddressEntry 会返回 87/1168。150ms 间隔、4s 预算
+/// 覆盖现场日志观察到的最长延迟，同时不会让连接流程明显变慢。
+const IP_CONFIG_RETRY_INTERVAL: Duration = Duration::from_millis(150);
+const IP_CONFIG_RETRY_BUDGET: Duration = Duration::from_millis(4000);
+
+/// 名字出现后，等待 IPv4 IP 层接口就绪的上限。超时只告警不失败，
+/// 交给 add_ip_address 的重试兜底，避免 IPv6-only 场景被误判。
+const INTERFACE_READY_BUDGET: Duration = Duration::from_millis(5000);
+
+fn is_retryable_ifcfg_error(code: Option<u32>) -> bool {
+    match code {
+        // name -> index 还没查到，说明适配器刚创建、还没注册完
+        None => true,
+        // 87  = ERROR_INVALID_PARAMETER：接口存在但还不能接收地址
+        // 1168 = ERROR_NOT_FOUND：接口还没进入 IP 层
+        Some(code) => code == ERROR_INVALID_PARAMETER.0 || code == ERROR_NOT_FOUND.0,
+    }
+}
+
 impl WindowsIfConfiger {
     pub fn get_interface_index(name: &str) -> Option<u32> {
         crate::arch::windows::find_interface_index(name).ok()
@@ -64,13 +85,56 @@ impl WindowsIfConfiger {
 
     #[tracing::instrument(err, ret)]
     async fn add_ip_address(name: &str, addr: Ipv4Inet) -> Result<(), Error> {
-        let if_index = Self::get_interface_index(name).ok_or(Error::NotFound)?;
-        let luid = InterfaceLuid::luid_from_index(if_index).map_err(|e| {
-            anyhow::anyhow!("Failed to get interface luid: {}", format_win_error(e))
-        })?;
-        luid.add_ipv4_address(&addr)
-            .map_err(|e| anyhow::anyhow!("Failed to add IPv4 address: {}", format_win_error(e)))?;
-        Ok(())
+        let started = Instant::now();
+        let mut attempts: u32 = 0;
+        loop {
+            attempts += 1;
+            // 每一轮都必须重新做 name -> if_index -> LUID 的解析。
+            // 适配器在创建/重建窗口内可能换掉 LUID，缓存第一次的 LUID 再重试
+            // 只会一直拿到同一个错误（本机实验：旧 LUID 等 1s 仍是 1168）。
+            match Self::try_add_ip_address(name, &addr) {
+                Ok(()) => {
+                    if attempts > 1 {
+                        tracing::info!(
+                            ?name,
+                            attempts,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "IPv4 address added after retry"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err((code, last_error)) => {
+                    let elapsed = started.elapsed();
+                    if !is_retryable_ifcfg_error(code) || elapsed >= IP_CONFIG_RETRY_BUDGET {
+                        return Err(Error::InterfaceNotReady {
+                            ifname: name.to_string(),
+                            operation: "add_ipv4_address",
+                            attempts,
+                            elapsed_ms: elapsed.as_millis() as u64,
+                            last_error,
+                        });
+                    }
+                    tracing::warn!(
+                        ?name,
+                        attempts,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        %last_error,
+                        "interface not ready for IPv4 address, retrying"
+                    );
+                    tokio::time::sleep(IP_CONFIG_RETRY_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    fn try_add_ip_address(name: &str, addr: &Ipv4Inet) -> Result<(), (Option<u32>, String)> {
+        let if_index = Self::get_interface_index(name)
+            .ok_or_else(|| (None, "interface not found".to_string()))?;
+        let luid =
+            InterfaceLuid::luid_from_index(if_index).map_err(|e| (Some(e), format_win_error(e)))?;
+        luid.add_ipv4_address(addr)
+            .map_err(|e| (Some(e), format_win_error(e)))
     }
 
     #[tracing::instrument(err, ret)]
@@ -250,12 +314,41 @@ impl IfConfiguerTrait for WindowsIfConfiger {
     }
 
     async fn wait_interface_show(&self, name: &str) -> Result<(), Error> {
-        loop {
+        // 第一步：等名字出现。这里保持无超时，避免开机/TUN 创建慢时误判。
+        let if_index = loop {
             if let Some(idx) = Self::get_interface_index(name) {
                 tracing::info!(?name, ?idx, "Interface found");
+                break idx;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        // 第二步：等 IPv4 IP 层接口就绪，最多 5s。
+        // 唯一就绪判据是 GetIpInterfaceEntry(AF_INET)：它和失败的
+        // SetIpInterfaceEntry / CreateUnicastIpAddressEntry 查同一张表；
+        // 而 GetIfEntry/SetIfEntry（link_up）在故障现场是成功的，不能作为判据。
+        let deadline = Instant::now() + INTERFACE_READY_BUDGET;
+        loop {
+            let ready = Self::get_interface_index(name)
+                .and_then(|idx| InterfaceLuid::luid_from_index(idx).ok())
+                .map(|luid| luid.is_ipv4_interface_ready())
+                .unwrap_or(false);
+            if ready {
+                tracing::info!(?name, ?if_index, "Interface IPv4 stack ready");
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if Instant::now() >= deadline {
+                // IPv6-only 或被安全软件拖慢时不在这里失败，
+                // 由 add_ip_address 的 4s 重试和外层 NIC 重建兜底。
+                tracing::warn!(
+                    ?name,
+                    ?if_index,
+                    elapsed_ms = INTERFACE_READY_BUDGET.as_millis() as u64,
+                    "IPv4 stack not ready after wait, continue and let address assignment retry"
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 

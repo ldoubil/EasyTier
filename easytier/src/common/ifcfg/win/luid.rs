@@ -72,6 +72,25 @@ impl InterfaceLuid {
         result == NO_ERROR
     }
 
+    /// 判断该接口是否已经出现在 IPv6 协议栈中。
+    ///
+    /// 和 `is_ipv4_interface_ready` 同理，查的是 IPv6 接口表：适配器没绑定
+    /// `ms_tcpip6`、或系统用 `DisabledComponents` 关掉 IPv6 时，这里会返回
+    /// 1168（ERROR_ELEMENT_NOT_FOUND），此时不应再向它申请 IPv6 地址。
+    pub fn ipv6_interface_status(&self) -> Result<(), NETIO_STATUS> {
+        let mut row = MIB_IPINTERFACE_ROW {
+            Family: AF_INET6 as ADDRESS_FAMILY,
+            InterfaceLuid: self.luid,
+            ..Default::default()
+        };
+        let result = unsafe { GetIpInterfaceEntry(&mut row) };
+        if result == NO_ERROR {
+            Ok(())
+        } else {
+            Err(result)
+        }
+    }
+
     /// add_ipv6_address method adds new unicast IP address to the interface. Corresponds to CreateUnicastIpAddressEntry function
     /// (https://docs.microsoft.com/en-us/windows/desktop/api/netioapi/nf-netioapi-createunicastipaddressentry).
     pub fn add_ipv6_address(&self, address: &Ipv6Inet) -> Result<(), NETIO_STATUS> {

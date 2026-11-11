@@ -160,6 +160,11 @@ impl NativeDhcpHost {
         self.set_addresses(DhcpAddresses::default());
         self.ensure_open()?;
 
+        // IPv6 没配上时（例如系统禁用 IPv6）不能把 DHCP 给的地址写回
+        // global_ctx，否则会对外宣告一个网卡上并不存在的地址。
+        #[cfg(not(mobile))]
+        let mut applied_ipv6 = next.ipv6;
+
         #[cfg(not(mobile))]
         {
             let addresses = self.with_static_addresses(next);
@@ -184,7 +189,8 @@ impl NativeDhcpHost {
                         result = nic.run(addresses.ipv4, addresses.ipv6) => result,
                     };
                     match run_result {
-                        Ok(()) => {
+                        Ok(assigned_ipv6) => {
+                            applied_ipv6 = assigned_ipv6;
                             let magic_dns = if let Some(ip) = addresses.ipv4 {
                                 let shared_route_backend = nic.shared_route_backend_for_dns();
                                 MagicDnsRuntime::start(
@@ -226,6 +232,12 @@ impl NativeDhcpHost {
                 }
             }
         }
+        #[cfg(not(mobile))]
+        self.set_addresses(DhcpAddresses {
+            ipv4: next.ipv4,
+            ipv6: applied_ipv6,
+        });
+        #[cfg(mobile)]
         self.set_addresses(next);
         Ok(())
     }

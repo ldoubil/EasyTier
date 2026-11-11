@@ -8,7 +8,10 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
     time::{Duration, Instant},
 };
-use windows::Win32::NetworkManagement::IpHelper::INTERNAL_IF_OPER_STATUS;
+use windows::Win32::NetworkManagement::IpHelper::{
+    FreeMibTable, GetIpInterfaceTable, INTERNAL_IF_OPER_STATUS, MIB_IPINTERFACE_TABLE,
+};
+use windows::Win32::Networking::WinSock::AF_INET6;
 use windows::Win32::{
     Foundation::{ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, NO_ERROR},
     NetworkManagement::IpHelper::{GetIfEntry, MIB_IFROW, SetIfEntry},
@@ -81,6 +84,38 @@ fn is_retryable_ifcfg_error(code: Option<u32>) -> bool {
 impl WindowsIfConfiger {
     pub fn get_interface_index(name: &str) -> Option<u32> {
         crate::arch::windows::find_interface_index(name).ok()
+    }
+
+    /// 系统级 IPv6 能力探测：注册表策略 + IPv6 接口表。
+    ///
+    /// 返回 `Some(原因)` 表示本机 IPv6 不可用。只做只读查询，不修改任何设置。
+    fn system_ipv6_unavailable_reason() -> Option<String> {
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        if let Ok(params) = hklm.open_subkey_with_flags(
+            r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
+            KEY_READ,
+        ) && let Ok(value) = params.get_value::<u32, _>("DisabledComponents")
+        {
+            // 0x01：所有非回环接口禁用 IPv6；0xFF：完全禁用（“优化”脚本常见做法）。
+            if value & 0x01 != 0 || value == 0xFF {
+                return Some(format!("系统策略已禁用 IPv6：DisabledComponents=0x{value:X}"));
+            }
+        }
+
+        let mut table: *mut MIB_IPINTERFACE_TABLE = std::ptr::null_mut();
+        let ret = unsafe { GetIpInterfaceTable(AF_INET6, &mut table) };
+        if ret != NO_ERROR {
+            return Some(format!(
+                "IPv6 接口表读取失败：GetIpInterfaceTable(AF_INET6) {}",
+                format_win_error(ret.0)
+            ));
+        }
+        let entries = unsafe { (*table).NumEntries };
+        unsafe { FreeMibTable(table as *const core::ffi::c_void) };
+        if entries == 0 {
+            return Some("IPv6 接口表为空：系统没有可用的 IPv6 协议栈".to_string());
+        }
+        None
     }
 
     #[tracing::instrument(err, ret)]
@@ -347,6 +382,36 @@ impl IfConfiguerTrait for WindowsIfConfiger {
                     "IPv4 stack not ready after wait, continue and let address assignment retry"
                 );
                 return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// IPv6 是可选能力：不少 Windows 机器（尤其被“优化”过的）直接关掉了
+    /// IPv6。探测失败时调用方完全不申请 IPv6 地址，而不是申请失败后回滚。
+    async fn ipv6_unavailable_reason(&self, name: Option<&str>) -> Option<String> {
+        if let Some(reason) = Self::system_ipv6_unavailable_reason() {
+            return Some(reason);
+        }
+        let name = name?;
+        // 适配器刚创建时 IPv6 接口行可能稍晚才出现，给 1s 观察窗口。
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        loop {
+            let reason = match Self::get_interface_index(name) {
+                Some(if_index) => match InterfaceLuid::luid_from_index(if_index) {
+                    Ok(luid) => match luid.ipv6_interface_status() {
+                        Ok(()) => return None,
+                        Err(code) => format!(
+                            "适配器 {name} 没有 IPv6 接口行：GetIpInterfaceEntry(AF_INET6) code {code}\
+                             （ms_tcpip6 未绑定或系统禁用 IPv6）"
+                        ),
+                    },
+                    Err(code) => format!("ConvertInterfaceIndexToLuid({if_index}) code {code}"),
+                },
+                None => format!("找不到接口 {name}"),
+            };
+            if Instant::now() >= deadline {
+                return Some(reason);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

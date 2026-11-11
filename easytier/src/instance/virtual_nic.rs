@@ -858,6 +858,12 @@ impl VirtualNic {
         Ok(())
     }
 
+    /// 探测本机/本适配器的 IPv6 能力，返回不可用原因（`None` 表示可用）。
+    pub async fn ipv6_unavailable_reason(&self, name: Option<&str>) -> Option<String> {
+        let _g = self.config.net_ns.guard();
+        self.ifcfg.ipv6_unavailable_reason(name).await
+    }
+
     pub async fn add_ipv6(&self, ip: Ipv6Addr, cidr: i32) -> Result<(), Error> {
         let _g = self.config.net_ns.guard();
         self.ifcfg
@@ -1045,6 +1051,20 @@ impl NicBackend {
         match self {
             Self::Dedicated(nic) => nic.lock().await.add_ip(ip, cidr).await,
             Self::Shared(member) => member.add_ip(ip, cidr).await,
+        }
+    }
+
+    pub async fn ipv6_unavailable_reason(&self, name: Option<&str>) -> Option<String> {
+        match self {
+            Self::Dedicated(nic) => nic.lock().await.ipv6_unavailable_reason(name).await,
+            Self::Shared(member) => {
+                let shared_nic = member.shared_nic();
+                let nic = {
+                    let shared_nic = shared_nic.lock().await;
+                    shared_nic.nic()
+                };
+                nic.lock().await.ipv6_unavailable_reason(name).await
+            }
         }
     }
 
@@ -1562,12 +1582,30 @@ impl NicCtx {
         Ok(())
     }
 
+    /// 返回实际生效的 IPv6 地址。
+    ///
+    /// IPv6 属于“可选能力”：系统或适配器没有 IPv6 栈时（Windows 上典型是
+    /// CreateUnicastIpAddressEntry 返回 1168），只告警并继续，不能让已经
+    /// 配置好的 IPv4 一起作废——否则 DHCP 的 apply 会整体回滚并反复重建网卡。
     pub async fn run(
         &mut self,
         ipv4_addr: Option<cidr::Ipv4Inet>,
         ipv6_addr: Option<cidr::Ipv6Inet>,
-    ) -> Result<(), Error> {
-        let tunnel = match self.backend.create_dev().await {
+    ) -> Result<Option<cidr::Ipv6Inet>, Error> {
+        // IPv6 是可选能力：先探测系统是否具备 IPv6 栈。
+        // 不可用就完全不申请 IPv6 地址，而不是先申请再回滚。
+        let mut ipv6_addr = ipv6_addr;
+        if ipv6_addr.is_some()
+            && let Some(reason) = self.backend.ipv6_unavailable_reason(None).await
+        {
+            tracing::warn!(
+                reason = %reason,
+                "IPv6 unavailable on this machine, skip requesting virtual IPv6"
+            );
+            ipv6_addr = None;
+        }
+
+        let (tunnel, ifname) = match self.backend.create_dev().await {
             Ok(ret) => {
                 let ifname = self.tun_ifname().await?;
 
@@ -1576,14 +1614,32 @@ impl NicCtx {
                     let _ = RegistryManager::reg_change_catrgory_in_profile(&ifname);
                 }
 
-                self.global_ctx.set_tun_device_ready(ifname);
-                ret
+                self.global_ctx.set_tun_device_ready(ifname.clone());
+                (ret, ifname)
             }
             Err(err) => {
                 self.global_ctx.set_tun_device_error(err.to_string());
                 return Err(err);
             }
         };
+
+        // 适配器级探测：系统开着 IPv6 时，单个 Wintun 适配器仍可能没绑定 ms_tcpip6。
+        if ipv6_addr.is_some() {
+            match self.backend.ipv6_unavailable_reason(Some(&ifname)).await {
+                Some(reason) => {
+                    tracing::warn!(
+                        ifname = %ifname,
+                        reason = %reason,
+                        "IPv6 not usable on tun adapter, skip requesting virtual IPv6"
+                    );
+                    ipv6_addr = None;
+                }
+                None => tracing::info!(
+                    ifname = %ifname,
+                    "IPv6 stack usable on tun adapter, will assign virtual IPv6"
+                ),
+            }
+        }
 
         self.start_tunnel_forwarding(tunnel)?;
 
@@ -1595,8 +1651,22 @@ impl NicCtx {
         }
 
         // Assign IPv6 address if provided
+        let mut applied_ipv6 = None;
         if let Some(ipv6_addr) = ipv6_addr {
-            self.assign_ipv6_to_tun_device(ipv6_addr).await?;
+            match self.assign_ipv6_to_tun_device(ipv6_addr).await {
+                Ok(()) => applied_ipv6 = Some(ipv6_addr),
+                Err(err) => {
+                    // 常见原因：系统禁用 IPv6，或 Wintun 适配器没绑定 ms_tcpip6，
+                    // 导致 GetIpInterfaceEntry(AF_INET6) / CreateUnicastIpAddressEntry
+                    // 返回 1168（找不到元素）。错误串里带 Win32 错误码与系统原因。
+                    tracing::warn!(
+                        ifname = %ifname,
+                        ?ipv6_addr,
+                        error = %err,
+                        "failed to assign IPv6 address on tun device, keeping IPv4 only"
+                    );
+                }
+            }
         }
 
         self.run_proxy_cidrs_route_updater().await?;
@@ -1605,7 +1675,7 @@ impl NicCtx {
         // without recreating the NIC.
         self.run_public_ipv6_addr_updater().await?;
 
-        Ok(())
+        Ok(applied_ipv6)
     }
 
     #[cfg(any(mobile, test))]

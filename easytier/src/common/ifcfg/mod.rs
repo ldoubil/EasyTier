@@ -113,6 +113,13 @@ pub trait IfConfiguerTrait: Send + Sync {
     async fn wait_interface_show(&self, _name: &str) -> Result<(), Error> {
         return Ok(());
     }
+    /// 探测本机（以及指定适配器）是否具备可用的 IPv6 栈。
+    ///
+    /// 返回 `Some(原因)` 表示不可用，调用方应当直接跳过 IPv6 配置；
+    /// `None` 表示可用。默认平台（Linux/macOS）一律视为可用。
+    async fn ipv6_unavailable_reason(&self, _name: Option<&str>) -> Option<String> {
+        None
+    }
     async fn set_mtu(&self, _name: &str, _mtu: u32) -> Result<(), Error> {
         Ok(())
     }
